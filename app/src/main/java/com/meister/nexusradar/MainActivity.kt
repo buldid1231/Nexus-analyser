@@ -12,15 +12,16 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -78,7 +79,7 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun RadarApp() {
-        var tab by remember { mutableIntStateOf(0) }
+        var screen by rememberSaveable { mutableIntStateOf(0) }
         var scanStatus by remember { mutableStateOf("Bereit") }
         var exportStatus by remember { mutableStateOf("Noch kein Export ausgeführt") }
         var address by remember {
@@ -87,7 +88,10 @@ class MainActivity : ComponentActivity() {
         var scanState by remember { mutableStateOf(scanStore.load()) }
         var settings by remember { mutableStateOf(settingsStore.load()) }
         var exportUri by remember { mutableStateOf(exportStore.load()) }
+        var catalogFilters by remember { mutableStateOf(CatalogFilterState()) }
         val mods by repo.observeMods().collectAsState(initial = emptyList())
+        val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+        val scope = rememberCoroutineScope()
 
         val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) {
@@ -130,86 +134,334 @@ class MainActivity : ComponentActivity() {
                 ?: "Kein Exportordner gewählt"
         }
 
-        Scaffold(
-            topBar = {
-                TopAppBar(
-                    title = {
-                        Column {
-                            Text("Nexus Skyrim Radar", maxLines = 1)
-                            Text("v0.8", style = MaterialTheme.typography.labelSmall)
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.surface
+        ModalNavigationDrawer(
+            drawerState = drawerState,
+            drawerContent = {
+                ModalDrawerSheet(Modifier.widthIn(max = 360.dp)) {
+                    AppDrawer(
+                        currentScreen = screen,
+                        selectScreen = { selected ->
+                            screen = selected
+                            scope.launch { drawerState.close() }
+                        },
+                        mods = mods,
+                        filters = catalogFilters,
+                        updateFilters = { catalogFilters = it },
+                        resetFilters = { catalogFilters = CatalogFilterState() }
                     )
-                )
+                }
             }
-        ) { padding ->
-            Column(Modifier.padding(padding).fillMaxSize()) {
-                val tabs = listOf("Scanner", "Katalog", "Setup", "Export")
-                ScrollableTabRow(
-                    selectedTabIndex = tab,
-                    edgePadding = 0.dp,
-                    containerColor = MaterialTheme.colorScheme.surface
-                ) {
-                    tabs.forEachIndexed { index, label ->
-                        Tab(
-                            selected = tab == index,
-                            onClick = { tab = index },
-                            modifier = Modifier.widthIn(min = 88.dp),
-                            text = { Text(label, maxLines = 1) }
+        ) {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        navigationIcon = {
+                            IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                                Text("☰", style = MaterialTheme.typography.headlineSmall)
+                            }
+                        },
+                        title = {
+                            Column {
+                                Text(
+                                    listOf("Scanner", "Katalog", "Setup", "Export")[screen],
+                                    maxLines = 1
+                                )
+                                Text("Nexus Skyrim Radar • v0.9", style = MaterialTheme.typography.labelSmall)
+                            }
+                        },
+                        actions = {
+                            if (screen == 1 && catalogFilters.activeCount() > 0) {
+                                Surface(
+                                    shape = RoundedCornerShape(50),
+                                    color = MaterialTheme.colorScheme.primaryContainer
+                                ) {
+                                    Text(
+                                        catalogFilters.activeCount().toString(),
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                        style = MaterialTheme.typography.labelLarge
+                                    )
+                                }
+                                Spacer(Modifier.width(10.dp))
+                            }
+                        },
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.surface
+                        )
+                    )
+                }
+            ) { padding ->
+                Box(Modifier.padding(padding).fillMaxSize()) {
+                    when (screen) {
+                        0 -> BrowserPane(
+                            address = address,
+                            setAddress = { address = it },
+                            status = scanStatus,
+                            setStatus = { scanStatus = it },
+                            scanState = scanState,
+                            setScanState = { state ->
+                                scanState = state
+                                scanStore.save(state)
+                            },
+                            settings = settings
+                        )
+                        1 -> CatalogPane(
+                            mods = mods,
+                            filters = catalogFilters,
+                            updateFilters = { catalogFilters = it },
+                            openFilters = { scope.launch { drawerState.open() } }
+                        )
+                        2 -> SettingsPane(settings) {
+                            settings = it.normalized()
+                            settingsStore.save(settings)
+                        }
+                        else -> ExportPane(
+                            mods = mods,
+                            status = exportStatus,
+                            settings = settings,
+                            updateSettings = {
+                                settings = it.normalized()
+                                settingsStore.save(settings)
+                            },
+                            folderName = exportFolderName,
+                            chooseFolder = { exportDirectoryPicker.launch(exportUri) },
+                            importClick = {
+                                importer.launch(arrayOf("application/json", "text/plain"))
+                            },
+                            exportClick = {
+                                val target = exportUri
+                                if (target == null) {
+                                    exportStatus = "Bitte zuerst einen Exportordner wählen"
+                                } else {
+                                    lifecycleScope.launch {
+                                        exportStatus = "Export läuft …"
+                                        runCatching { export(target, settings) }
+                                            .onSuccess { exportStatus = it }
+                                            .onFailure {
+                                                exportStatus = "Exportfehler: ${it.message ?: "Schreibzugriff fehlgeschlagen"}"
+                                            }
+                                    }
+                                }
+                            }
                         )
                     }
                 }
-                when (tab) {
-                    0 -> BrowserPane(
-                        address = address,
-                        setAddress = { address = it },
-                        status = scanStatus,
-                        setStatus = { scanStatus = it },
-                        scanState = scanState,
-                        setScanState = { state ->
-                            scanState = state
-                            scanStore.save(state)
-                        },
-                        settings = settings
-                    )
-                    1 -> CatalogPane(mods)
-                    2 -> SettingsPane(settings) {
-                        settings = it.normalized()
-                        settingsStore.save(settings)
+            }
+        }
+    }
+
+    @OptIn(ExperimentalLayoutApi::class)
+    @Composable
+    private fun AppDrawer(
+        currentScreen: Int,
+        selectScreen: (Int) -> Unit,
+        mods: List<ModEntity>,
+        filters: CatalogFilterState,
+        updateFilters: (CatalogFilterState) -> Unit,
+        resetFilters: () -> Unit
+    ) {
+        val screens = listOf("Scanner", "Katalog", "Setup", "Export")
+        val categoryCounts = remember(mods) {
+            mods.groupingBy {
+                it.category?.takeIf(String::isNotBlank) ?: UNKNOWN_CATEGORY
+            }.eachCount().toList().sortedBy { it.first.lowercase() }
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxHeight().padding(horizontal = 12.dp),
+            contentPadding = PaddingValues(top = 18.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            item {
+                Text(
+                    "Nexus Skyrim Radar",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                )
+                Text(
+                    "v0.9 • lokaler Mod-Katalog",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
+                )
+            }
+            items(screens.indices.toList()) { index ->
+                NavigationDrawerItem(
+                    label = { Text(screens[index]) },
+                    selected = currentScreen == index,
+                    onClick = { selectScreen(index) },
+                    badge = {
+                        if (index == 1) Text(mods.size.toString())
                     }
-                    else -> ExportPane(
-                        mods = mods,
-                        status = exportStatus,
-                        settings = settings,
-                        updateSettings = {
-                            settings = it.normalized()
-                            settingsStore.save(settings)
-                        },
-                        folderName = exportFolderName,
-                        chooseFolder = { exportDirectoryPicker.launch(exportUri) },
-                        importClick = {
-                            importer.launch(arrayOf("application/json", "text/plain"))
-                        },
-                        exportClick = {
-                            val target = exportUri
-                            if (target == null) {
-                                exportStatus = "Bitte zuerst einen Exportordner wählen"
-                            } else {
-                                lifecycleScope.launch {
-                                    exportStatus = "Export läuft …"
-                                    runCatching { export(target, settings) }
-                                        .onSuccess { exportStatus = it }
-                                        .onFailure {
-                                            exportStatus = "Exportfehler: ${it.message ?: "Schreibzugriff fehlgeschlagen"}"
-                                        }
-                                }
-                            }
+                )
+            }
+            item {
+                HorizontalDivider(Modifier.padding(vertical = 14.dp))
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Katalogfilter", fontWeight = FontWeight.Bold)
+                        Text(
+                            "${filters.activeCount()} aktiv",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    TextButton(onClick = resetFilters) { Text("Zurücksetzen") }
+                }
+            }
+            item {
+                DrawerSectionTitle("Inhalt")
+                DrawerCheckbox(
+                    label = "NSFW anzeigen",
+                    detail = "${mods.count { it.adult }} Adult-Mods im Katalog",
+                    checked = filters.showAdult,
+                    onChecked = { updateFilters(filters.copy(showAdult = it)) }
+                )
+                DrawerCheckbox(
+                    label = "Nur gewählter Zeitraum",
+                    checked = filters.onlyInRange,
+                    onChecked = { updateFilters(filters.copy(onlyInRange = it)) }
+                )
+                DrawerCheckbox(
+                    label = "Nur SKSE / DLL",
+                    checked = filters.onlySkseOrDll,
+                    onChecked = { updateFilters(filters.copy(onlySkseOrDll = it)) }
+                )
+                DrawerCheckbox(
+                    label = "Nur mit Requirements",
+                    checked = filters.onlyWithRequirements,
+                    onChecked = { updateFilters(filters.copy(onlyWithRequirements = it)) }
+                )
+                DrawerCheckbox(
+                    label = "Nach Kategorie gruppieren",
+                    checked = filters.groupByCategory,
+                    onChecked = { updateFilters(filters.copy(groupByCategory = it)) }
+                )
+            }
+            item {
+                DrawerSectionTitle("Status")
+                listOf(
+                    "NEW" to "Neu",
+                    "UPDATED" to "Aktualisiert",
+                    "UNCHANGED" to "Unverändert",
+                    "DISCOVERED" to "Nur entdeckt"
+                ).forEach { (state, label) ->
+                    DrawerCheckbox(
+                        label = label,
+                        checked = state in filters.selectedStates,
+                        onChecked = { checked ->
+                            updateFilters(
+                                filters.copy(
+                                    selectedStates = if (checked) {
+                                        filters.selectedStates + state
+                                    } else {
+                                        filters.selectedStates - state
+                                    }
+                                )
+                            )
                         }
                     )
                 }
             }
+            item {
+                DrawerSectionTitle("Sortierung")
+                CatalogSort.entries.forEach { sort ->
+                    DrawerRadio(
+                        label = sort.label,
+                        selected = filters.sort == sort,
+                        onClick = { updateFilters(filters.copy(sort = sort)) }
+                    )
+                }
+            }
+            item {
+                DrawerSectionTitle("Dateigröße")
+                SizeFilter.entries.forEach { size ->
+                    DrawerRadio(
+                        label = size.label,
+                        selected = filters.sizeFilter == size,
+                        onClick = { updateFilters(filters.copy(sizeFilter = size)) }
+                    )
+                }
+            }
+            item {
+                DrawerSectionTitle("Nexus-Kategorien")
+                DrawerCheckbox(
+                    label = "Alle Kategorien",
+                    detail = "${mods.size} Mods",
+                    checked = filters.selectedCategories.isEmpty(),
+                    onChecked = { checked ->
+                        if (checked) updateFilters(filters.copy(selectedCategories = emptySet()))
+                    }
+                )
+            }
+            items(categoryCounts, key = { "drawer-category:${it.first}" }) { (category, count) ->
+                DrawerCheckbox(
+                    label = category,
+                    detail = "$count Mods",
+                    checked = category in filters.selectedCategories,
+                    onChecked = { checked ->
+                        updateFilters(
+                            filters.copy(
+                                selectedCategories = if (checked) {
+                                    filters.selectedCategories + category
+                                } else {
+                                    filters.selectedCategories - category
+                                }
+                            )
+                        )
+                    }
+                )
+            }
+        }
+    }
+
+    @Composable
+    private fun DrawerSectionTitle(title: String) {
+        Text(
+            title.uppercase(),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(start = 12.dp, top = 18.dp, bottom = 5.dp)
+        )
+    }
+
+    @Composable
+    private fun DrawerCheckbox(
+        label: String,
+        detail: String? = null,
+        checked: Boolean,
+        onChecked: (Boolean) -> Unit
+    ) {
+        Row(
+            Modifier.fillMaxWidth().clickable { onChecked(!checked) }.padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Checkbox(checked = checked, onCheckedChange = onChecked)
+            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                Text(label, style = MaterialTheme.typography.bodyMedium)
+                if (detail != null) {
+                    Text(
+                        detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun DrawerRadio(label: String, selected: Boolean, onClick: () -> Unit) {
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 1.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            RadioButton(selected = selected, onClick = onClick)
+            Text(label, style = MaterialTheme.typography.bodyMedium)
         }
     }
 
@@ -485,8 +737,20 @@ class MainActivity : ComponentActivity() {
         expectedId: Long?
     ): Boolean {
         return try {
-            val record = parseRecordWithRetry(web, expectedId)
+            var record = parseRecordWithRetry(web, expectedId)
                 ?: error("Nexus-Metadaten wurden nicht rechtzeitig geladen")
+            if (settings.scanFileSizes && !record.url.isNullOrBlank()) {
+                setStatus("Lese Dateigröße: ${record.name}")
+                web.loadUrl(record.url + "?tab=files")
+                delay(settings.delayMs.coerceAtLeast(1500L))
+                val metrics = parseFileMetricsWithRetry(web)
+                if (metrics != null) {
+                    record = record.copy(
+                        file_size_bytes = metrics.file_size_bytes,
+                        main_files_count = metrics.main_files_count
+                    )
+                }
+            }
             val (state, inRange) = RangeClassifier.classify(
                 record.published_at,
                 record.updated_at,
@@ -516,7 +780,9 @@ class MainActivity : ComponentActivity() {
     ): NexusModRecord? {
         var best: NexusModRecord? = null
         var bestScore = -1
-        repeat(10) {
+        runCatching { evaluateJavascript(web, NexusPageParser.expandMetadataSections) }
+        delay(350)
+        repeat(10) { attempt ->
             val candidate = runCatching {
                 val raw = evaluateJavascript(web, NexusPageParser.parseCurrentMod)
                 json.decodeFromString<NexusModRecord>(decodeJsString(raw))
@@ -533,7 +799,8 @@ class MainActivity : ComponentActivity() {
                     candidate.version != null &&
                     candidate.category != null &&
                     candidate.published_at != null &&
-                    candidate.updated_at != null
+                    candidate.updated_at != null &&
+                    attempt >= 2
                 ) {
                     return candidate
                 }
@@ -550,8 +817,27 @@ class MainActivity : ComponentActivity() {
             !record.version.isNullOrBlank(),
             !record.category.isNullOrBlank(),
             !record.published_at.isNullOrBlank(),
-            !record.updated_at.isNullOrBlank()
+            !record.updated_at.isNullOrBlank(),
+            !record.author.isNullOrBlank(),
+            record.endorsements != null,
+            record.total_downloads != null
         ).count { it }
+
+    private suspend fun parseFileMetricsWithRetry(web: WebView): NexusFileMetrics? {
+        var best: NexusFileMetrics? = null
+        repeat(8) {
+            val candidate = runCatching {
+                val raw = evaluateJavascript(web, NexusPageParser.parseFilesTab)
+                json.decodeFromString<NexusFileMetrics>(decodeJsString(raw))
+            }.getOrNull()
+            if (candidate != null) {
+                best = candidate
+                if (candidate.file_size_bytes != null) return candidate
+            }
+            delay(500)
+        }
+        return best
+    }
 
     private suspend fun readVisibleLinksWithRetry(web: WebView): VisibleLinksResult? {
         var best: VisibleLinksResult? = null
@@ -580,104 +866,156 @@ class MainActivity : ComponentActivity() {
         Regex("/skyrimspecialedition/mods/\\d+", RegexOption.IGNORE_CASE)
             .containsMatchIn(url.orEmpty())
 
+    @OptIn(ExperimentalLayoutApi::class)
     @Composable
-    private fun CatalogPane(mods: List<ModEntity>) {
-        var query by remember { mutableStateOf("") }
-        var filter by remember { mutableStateOf("ALL") }
-        val newCount = mods.count { it.collectionState == "NEW" && it.inSelectedRange }
-        val updatedCount = mods.count {
-            it.collectionState == "UPDATED" && it.inSelectedRange
-        }
-        val adultCount = mods.count { it.adult }
-
-        val filtered = remember(mods, query, filter) {
-            mods.filter { mod ->
-                val matchesState = when (filter) {
-                    "NEW" -> mod.collectionState == "NEW" && mod.inSelectedRange
-                    "UPDATED" -> mod.collectionState == "UPDATED" && mod.inSelectedRange
-                    "ADULT" -> mod.adult
-                    else -> true
-                }
-                val haystack = listOf(
-                    mod.name,
-                    mod.author.orEmpty(),
-                    mod.category.orEmpty(),
-                    mod.modId.toString()
-                ).joinToString(" ").lowercase()
-                matchesState && (query.isBlank() || query.lowercase() in haystack)
-            }
+    private fun CatalogPane(
+        mods: List<ModEntity>,
+        filters: CatalogFilterState,
+        updateFilters: (CatalogFilterState) -> Unit,
+        openFilters: () -> Unit
+    ) {
+        var query by rememberSaveable { mutableStateOf("") }
+        val collapsedCategories = remember { mutableStateMapOf<String, Boolean>() }
+        val filtered = remember(mods, query, filters) {
+            applyCatalogFilters(mods, query, filters)
         }
         val byCategory = remember(filtered) {
             filtered.groupBy {
-                it.category?.takeIf(String::isNotBlank) ?: "Kategorie noch nicht erkannt"
+                it.category?.takeIf(String::isNotBlank) ?: UNKNOWN_CATEGORY
             }
         }
         val categoryNames = remember(byCategory) {
             byCategory.keys.sortedWith(
-                compareBy<String> { if (it == "Kategorie noch nicht erkannt") 1 else 0 }
+                compareBy<String> { if (it == UNKNOWN_CATEGORY) 1 else 0 }
                     .thenBy { it.lowercase() }
             )
         }
+        val newCount = mods.count { it.collectionState == "NEW" && it.inSelectedRange }
+        val updatedCount = mods.count { it.collectionState == "UPDATED" && it.inSelectedRange }
+        val adultCount = mods.count { it.adult }
 
         Column(
-            Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(
-                "Mod-Katalog",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold
-            )
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                item { StatBadge("Gesamt", mods.size) }
-                item { StatBadge("NEW", newCount) }
-                item { StatBadge("UPDATED", updatedCount) }
-                item { StatBadge("Adult", adultCount) }
-                item { StatBadge("Kategorien", byCategory.size) }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Mod-Katalog",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        "${filtered.size} von ${mods.size} Mods",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                OutlinedButton(onClick = openFilters) {
+                    Text(
+                        if (filters.activeCount() == 0) "Filter"
+                        else "Filter · ${filters.activeCount()}"
+                    )
+                }
             }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                StatBadge("Gesamt", mods.size)
+                StatBadge("Neu", newCount)
+                StatBadge("Updates", updatedCount)
+                StatBadge("NSFW", adultCount)
+                StatBadge("Kategorien", mods.mapNotNull { it.category }.distinct().size)
+            }
+
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
-                label = { Text("Mods oder Kategorien durchsuchen") }
+                label = { Text("Mods, Autoren oder Kategorien suchen") },
+                trailingIcon = {
+                    if (query.isNotBlank()) {
+                        TextButton(onClick = { query = "" }) { Text("×") }
+                    }
+                }
             )
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                items(
-                    listOf(
-                        "ALL" to "Alle",
-                        "NEW" to "Neu",
-                        "UPDATED" to "Aktualisiert",
-                        "ADULT" to "Adult"
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        filters.sort.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
                     )
-                ) { (value, label) ->
-                    FilterChip(
-                        selected = filter == value,
-                        onClick = { filter = value },
-                        label = { Text(label) }
-                    )
+                    TextButton(onClick = {
+                        updateFilters(CatalogFilterState())
+                    }) { Text("Filter löschen") }
                 }
             }
+
             if (filtered.isEmpty()) {
                 ElevatedCard(Modifier.fillMaxWidth()) {
-                    Text(
-                        if (mods.isEmpty()) "Noch keine Mods gescannt"
-                        else "Für diesen Filter wurden keine Mods gefunden",
-                        modifier = Modifier.padding(16.dp)
-                    )
+                    Column(
+                        Modifier.fillMaxWidth().padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            if (mods.isEmpty()) "Noch keine Mods gescannt"
+                            else "Keine Mods passen zu diesen Filtern",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        if (mods.isNotEmpty()) {
+                            Text(
+                                "Öffne das Menü und lockere Kategorie, Status, Größe oder NSFW-Filter.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
             } else {
                 LazyColumn(
                     modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(7.dp),
-                    contentPadding = PaddingValues(bottom = 16.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(bottom = 20.dp)
                 ) {
-                    categoryNames.forEach { category ->
-                        val categoryMods = byCategory[category].orEmpty()
-                        item(key = "category:$category") {
-                            CategoryHeader(category, categoryMods.size)
+                    if (filters.groupByCategory) {
+                        categoryNames.forEach { category ->
+                            val categoryMods = byCategory[category].orEmpty()
+                            val collapsed = collapsedCategories[category] == true
+                            item(key = "category:$category") {
+                                CategoryHeader(
+                                    category = category,
+                                    count = categoryMods.size,
+                                    collapsed = collapsed,
+                                    toggle = {
+                                        collapsedCategories[category] = !collapsed
+                                    }
+                                )
+                            }
+                            if (!collapsed) {
+                                items(categoryMods, key = { "mod:${it.modId}" }) { mod ->
+                                    ModCard(mod)
+                                }
+                            }
                         }
-                        items(categoryMods, key = { "mod:${it.modId}" }) { mod ->
+                    } else {
+                        items(filtered, key = { "mod:${it.modId}" }) { mod ->
                             ModCard(mod)
                         }
                     }
@@ -694,62 +1032,75 @@ class MainActivity : ComponentActivity() {
         ) {
             Text(
                 "$label $count",
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                style = MaterialTheme.typography.labelLarge
+                modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                style = MaterialTheme.typography.labelMedium
             )
         }
     }
 
     @Composable
-    private fun CategoryHeader(category: String, count: Int) {
-        Row(
-            Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 2.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+    private fun CategoryHeader(
+        category: String,
+        count: Int,
+        collapsed: Boolean,
+        toggle: () -> Unit
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().clickable(onClick = toggle),
+            color = Color.Transparent
         ) {
-            Text(
-                category,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.Bold
-            )
-            Surface(
-                shape = RoundedCornerShape(50),
-                color = MaterialTheme.colorScheme.primaryContainer
+            Row(
+                Modifier.fillMaxWidth().padding(top = 11.dp, bottom = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    count.toString(),
-                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp),
-                    style = MaterialTheme.typography.labelMedium
+                    (if (collapsed) "›  " else "⌄  ") + category,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
                 )
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = MaterialTheme.colorScheme.primaryContainer
+                ) {
+                    Text(
+                        count.toString(),
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
             }
         }
     }
 
+    @OptIn(ExperimentalLayoutApi::class)
     @Composable
     private fun ModCard(mod: ModEntity) {
-        ElevatedCard(Modifier.fillMaxWidth()) {
+        var expanded by rememberSaveable(mod.modId) { mutableStateOf(false) }
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }
+        ) {
             Column(
-                Modifier.fillMaxWidth().padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                Modifier.fillMaxWidth().padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(
-                    mod.name,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
                 Row(
                     Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Top
                 ) {
                     Text(
-                        "#${mod.modId} • v${mod.version ?: "?"}",
-                        style = MaterialTheme.typography.bodySmall
+                        mod.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = if (expanded) 5 else 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f).padding(end = 10.dp)
                     )
                     Text(
-                        mod.collectionState + if (mod.adult) " • ADULT" else "",
+                        mod.collectionState,
                         style = MaterialTheme.typography.labelMedium,
                         color = when (mod.collectionState) {
                             "NEW" -> MaterialTheme.colorScheme.primary
@@ -759,19 +1110,83 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 Text(
-                    "Update: ${displayDate(mod.updatedAt)}" +
+                    "#${mod.modId} • v${mod.version ?: "?"}" +
                         (mod.author?.let { " • $it" } ?: ""),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                if (mod.diagnostics.isNotBlank()) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    MetaBadge("Update ${displayDate(mod.updatedAt)}")
+                    MetaBadge(formatBytes(mod.fileSizeBytes))
+                    if (mod.adult) MetaBadge("NSFW", alert = true)
+                    if (mod.hasSkseHint || mod.hasDllHint) MetaBadge("SKSE / DLL")
+                }
+
+                if (expanded) {
+                    HorizontalDivider(Modifier.padding(vertical = 3.dp))
                     Text(
-                        "Metadaten unvollständig – bitte nach dem Update neu scannen",
+                        mod.category?.takeIf(String::isNotBlank) ?: UNKNOWN_CATEGORY,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    mod.summary?.takeIf(String::isNotBlank)?.let { summary ->
+                        Text(
+                            summary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 5,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        mod.endorsements?.let { MetaBadge("${formatCount(it)} Endorsements") }
+                        mod.totalDownloads?.let { MetaBadge("${formatCount(it)} Downloads") }
+                        mod.uniqueDownloads?.let { MetaBadge("${formatCount(it)} Unique DLs") }
+                        if (mod.mainFilesCount > 0) MetaBadge("${mod.mainFilesCount} Hauptdateien")
+                        if (mod.requirementsCount > 0) MetaBadge("${mod.requirementsCount} Requirements")
+                        if (mod.requiredByCount > 0) MetaBadge("Von ${formatCount(mod.requiredByCount.toLong())} Mods genutzt")
+                    }
+                    Text(
+                        "Veröffentlicht: ${displayDate(mod.publishedAt)} • Tippen zum Schließen",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (mod.diagnostics.isNotBlank()) {
+                        Text(
+                            "Einige Metadaten fehlen – diesen Mod bitte neu scannen.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                } else {
+                    Text(
+                        "Tippen für Details",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
+        }
+    }
+
+    @Composable
+    private fun MetaBadge(label: String, alert: Boolean = false) {
+        Surface(
+            shape = RoundedCornerShape(7.dp),
+            color = if (alert) MaterialTheme.colorScheme.errorContainer
+            else MaterialTheme.colorScheme.surfaceVariant
+        ) {
+            Text(
+                label,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.labelSmall
+            )
         }
     }
 
@@ -842,10 +1257,30 @@ class MainActivity : ComponentActivity() {
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-            SectionCard("Aktive Filter") {
+            SectionCard("Zusätzliche Metadaten") {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text("Dateigröße erfassen", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Öffnet pro Mod zusätzlich den Files-Tab. Das dauert länger, ermöglicht aber Größenfilter.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = current.scanFileSizes,
+                        onCheckedChange = { update(current.copy(scanFileSizes = it)) }
+                    )
+                }
+            }
+            SectionCard("Scan-Regeln") {
                 Text("✓ Adult-Mods bleiben erhalten")
                 Text("✓ Nexus-Kategorien werden übernommen")
-                Text("✓ Requirements und Required-by werden erfasst")
+                Text("✓ Autor, Statistik und Abhängigkeiten werden erfasst")
                 Text("× Übersetzungen, Bilder, Videos und Savegames")
             }
         }
@@ -1013,6 +1448,26 @@ class MainActivity : ComponentActivity() {
 
     private fun displayDate(value: String?): String =
         value?.substringBefore('T')?.takeIf(String::isNotBlank) ?: "unbekannt"
+
+    private fun formatBytes(value: Long?): String {
+        if (value == null) return "Größe unbekannt"
+        val kib = 1024.0
+        val mib = kib * 1024.0
+        val gib = mib * 1024.0
+        return when {
+            value >= gib -> String.format(java.util.Locale.GERMAN, "%.1f GB", value / gib)
+            value >= mib -> String.format(java.util.Locale.GERMAN, "%.1f MB", value / mib)
+            value >= kib -> String.format(java.util.Locale.GERMAN, "%.0f KB", value / kib)
+            else -> "$value B"
+        }
+    }
+
+    private fun formatCount(value: Long): String = when {
+        value >= 1_000_000_000 -> String.format(java.util.Locale.GERMAN, "%.1f Mrd.", value / 1_000_000_000.0)
+        value >= 1_000_000 -> String.format(java.util.Locale.GERMAN, "%.1f Mio.", value / 1_000_000.0)
+        value >= 1_000 -> String.format(java.util.Locale.GERMAN, "%.1f Tsd.", value / 1_000.0)
+        else -> value.toString()
+    }
 
     private fun decodeJsString(raw: String): String = runCatching {
         json.decodeFromString<String>(raw)

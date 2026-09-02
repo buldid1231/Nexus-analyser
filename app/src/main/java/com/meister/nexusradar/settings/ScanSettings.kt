@@ -32,7 +32,8 @@ data class ScanSettings(
     val delayMs: Long = 3000L,
     val pageLimit: Int = 5,
     val chunkSize: Int = 100,
-    val exportMode: ExportMode = ExportMode.CHANGED
+    val exportMode: ExportMode = ExportMode.CHANGED,
+    val scanFileSizes: Boolean = true
 ) {
     fun normalized(): ScanSettings = copy(
         rangeDays = rangeDays.coerceIn(1, 2190),
@@ -58,8 +59,8 @@ class ScanSettingsStore(context: Context) {
 object RangeClassifier {
     fun classify(publishedAt: String?, updatedAt: String?, rangeDays: Int, now: Instant = Instant.now()): Pair<String, Boolean> {
         val start = now.minus(Duration.ofDays(rangeDays.toLong()))
-        val published = parseInstant(publishedAt)
-        val updated = parseInstant(updatedAt)
+        val published = NexusDateParser.parseInstant(publishedAt)
+        val updated = NexusDateParser.parseInstant(updatedAt)
         val publishedInRange = published?.let { !it.isBefore(start) && !it.isAfter(now) } ?: false
         val updatedInRange = updated?.let { !it.isBefore(start) && !it.isAfter(now) } ?: false
         return when {
@@ -69,7 +70,10 @@ object RangeClassifier {
         }
     }
 
-    private fun parseInstant(value: String?): Instant? {
+}
+
+object NexusDateParser {
+    fun parseInstant(value: String?): Instant? {
         if (value.isNullOrBlank()) return null
         runCatching { return Instant.parse(value) }
         runCatching { return OffsetDateTime.parse(value).toInstant() }

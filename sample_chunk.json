@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 8,
   "game": "skyrimspecialedition",
   "generated_at": "2026-09-02T21:30:00+02:00",
   "chunk": 1,
@@ -16,6 +16,11 @@
       "updated_at": "2026-09-01T18:00:00Z",
       "adult": false,
       "url": "https://www.nexusmods.com/skyrimspecialedition/mods/123456",
+      "file_size_bytes": 73400320,
+      "main_files_count": 2,
+      "endorsements": 12400,
+      "unique_downloads": 183500,
+      "total_downloads": 314200,
       "tags": [
         "SKSE",
         "User Interface"
@@ -32,9 +37,12 @@
           "name": "Example Addon"
         }
       ],
+      "requirements_count": 1,
+      "required_by_count": 1,
       "content_type": "MOD",
       "collection_state": "NEW",
-      "in_selected_range": true
+      "in_selected_range": true,
+      "diagnostics": []
     }
   ],
   "scan_started_at": "2026-09-02T19:00:00Z",

@@ -14,6 +14,15 @@ interface ModDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertTags(items: List<TagEntity>)
 
+    @Query("DELETE FROM tags WHERE modId IN (:ids)")
+    suspend fun deleteTagsFor(ids: List<Long>)
+
+    @Query("DELETE FROM dependencies WHERE ownerModId IN (:ids)")
+    suspend fun deleteDependenciesFor(ids: List<Long>)
+
+    @Query("DELETE FROM dependencies WHERE ownerModId = :id AND relationType = :relationType")
+    suspend fun deleteDependenciesFor(id: Long, relationType: String)
+
     @Query("SELECT * FROM mods ORDER BY COALESCE(updatedAt, publishedAt, lastSeenAt) DESC")
     fun observeAll(): Flow<List<ModEntity>>
 

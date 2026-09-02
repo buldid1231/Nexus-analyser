@@ -5,12 +5,34 @@ package com.meister.nexusradar.browser
  * It reads visible mod metadata, but never passwords, form values or cookies.
  */
 object NexusPageParser {
+    val expandMetadataSections: String = """
+        (function() {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const wanted = /^(Nexus requirements|Mods (requiring|using) this (file|mod))(?:\s*\(\d+\))?$/i;
+          let clicked = 0;
+          for (const element of document.querySelectorAll('button, summary, [role="button"], h2, h3, h4')) {
+            if (!wanted.test(clean(element.textContent))) continue;
+            const target = element.matches('button, summary, [role="button"]')
+              ? element
+              : element.closest('button, summary, [role="button"]');
+            if (target && target.getAttribute('aria-expanded') !== 'true' && !target.open) {
+              try { target.click(); clicked++; } catch (_) {}
+            }
+          }
+          return clicked;
+        })();
+    """.trimIndent()
+
     val parseCurrentMod: String = """
         (function() {
           const result = {
             kind: 'mod', mod_id: 0, name: '', author: null, version: null,
             category: null, summary: null, published_at: null, updated_at: null,
-            adult: false, url: location.href, tags: [], requirements: [], required_by: [],
+            adult: false, url: location.href.split('?')[0].split('#')[0],
+            file_size_bytes: null, main_files_count: 0,
+            endorsements: null, unique_downloads: null, total_downloads: null,
+            tags: [], requirements: [], required_by: [],
+            requirements_count: 0, required_by_count: 0,
             content_type: 'MOD', diagnostics: []
           };
 
@@ -23,6 +45,43 @@ object NexusPageParser {
           };
           const metaProperty = (name) => document.querySelector('meta[property="' + name + '"]')?.content || null;
           const metaName = (name) => document.querySelector('meta[name="' + name + '"]')?.content || null;
+          const body = document.body?.innerText || '';
+
+          const leafLabels = (pattern) => [...document.querySelectorAll('h1,h2,h3,h4,h5,dt,th,strong,span,p,div')]
+            .filter(element => element.children.length === 0 && pattern.test(text(element)));
+          const valueAfterLabel = (pattern) => {
+            for (const label of leafLabels(pattern)) {
+              const sibling = label.nextElementSibling;
+              if (sibling && text(sibling) && !pattern.test(text(sibling))) {
+                const time = sibling.matches('time') ? sibling : sibling.querySelector('time');
+                return time?.getAttribute('datetime') || text(sibling);
+              }
+              const parent = label.parentElement;
+              if (!parent) continue;
+              const time = parent.querySelector('time');
+              if (time) return time.getAttribute('datetime') || text(time);
+              const values = [...parent.children]
+                .filter(child => child !== label)
+                .map(text)
+                .filter(value => value && !pattern.test(value));
+              if (values.length) return values[0];
+            }
+            return null;
+          };
+          const normalizeDate = (value) => {
+            if (!value) return null;
+            const cleaned = clean(value);
+            const parsed = new Date(cleaned);
+            return isNaN(parsed.getTime()) ? cleaned : parsed.toISOString();
+          };
+          const parseCount = (value) => {
+            if (value == null) return null;
+            const normalized = clean(value).replace(/\s/g, '').replace(/,/g, '');
+            const match = normalized.match(/([0-9]+(?:\.[0-9]+)?)\s*([KMB])?/i);
+            if (!match) return null;
+            const multiplier = ({K:1000, M:1000000, B:1000000000})[(match[2] || '').toUpperCase()] || 1;
+            return Math.round(Number(match[1]) * multiplier);
+          };
 
           result.mod_id = hrefId(location.href);
           result.name = text(document.querySelector('main h1, h1')) ||
@@ -39,7 +98,7 @@ object NexusPageParser {
             } catch (_) {}
           }
           const deepValue = (keys) => {
-            const wanted = new Set(keys.map(x => x.toLowerCase()));
+            const wanted = new Set(keys.map(key => key.toLowerCase()));
             const stack = [...structured];
             let visited = 0;
             while (stack.length && visited < 1000) {
@@ -60,63 +119,58 @@ object NexusPageParser {
             return null;
           };
 
-          const authorLink = [...document.querySelectorAll('a[href*="/users/"]')]
-            .find(a => text(a).length > 1 && !/profile|uploaded by/i.test(text(a)));
-          result.author = clean(deepValue(['author', 'creator'])) || text(authorLink) || null;
+          const labelledAuthor = valueAfterLabel(/^(Created by|Uploaded by)$/i);
+          const structuredAuthor = deepValue(['author', 'creator']);
+          const cleanAuthor = clean(labelledAuthor || structuredAuthor);
+          result.author = cleanAuthor && !/^(My mods|My profile|Guest)$/i.test(cleanAuthor)
+            ? cleanAuthor
+            : null;
 
           const categoryLinks = [...document.querySelectorAll('a[href*="categoryName="]')];
-          const categoryLink = categoryLinks.find(a => {
-            const label = text(a);
+          const categoryLink = categoryLinks.find(anchor => {
+            const label = text(anchor);
             return label && !/remove filter|clear|mod categories/i.test(label);
           });
           if (categoryLink) {
             result.category = text(categoryLink);
             if (!result.category) {
-              try { result.category = clean(new URL(categoryLink.href, location.href).searchParams.get('categoryName')); } catch (_) {}
+              try {
+                result.category = clean(new URL(categoryLink.href, location.href).searchParams.get('categoryName'));
+              } catch (_) {}
             }
           }
           if (!result.category) result.category = clean(deepValue(['categoryName', 'category'])) || null;
 
-          const tagHeading = [...document.querySelectorAll('h1,h2,h3,h4,h5')]
-            .find(h => /^Tags for this mod$/i.test(text(h)));
+          const tagHeading = [...document.querySelectorAll('h1,h2,h3,h4,h5,strong')]
+            .find(heading => /^Tags for this mod$/i.test(text(heading)));
           if (tagHeading) {
-            let tagBox = tagHeading.parentElement;
-            for (let i = 0; tagBox && i < 3; i++, tagBox = tagBox.parentElement) {
-              const labels = [...tagBox.querySelectorAll('a')]
-                .map(text)
-                .filter(label => label && !/view more/i.test(label));
-              if (labels.length) { result.tags = uniq(labels); break; }
+            const candidates = [];
+            let node = tagHeading.nextElementSibling;
+            let walked = 0;
+            while (node && walked < 6 && !/^H[1-5]$/.test(node.tagName)) {
+              for (const anchor of node.querySelectorAll('a')) {
+                const href = anchor.getAttribute('href') || '';
+                if (/tag|search/i.test(href)) candidates.push(text(anchor));
+              }
+              node = node.nextElementSibling;
+              walked++;
             }
+            if (!candidates.length) {
+              const box = tagHeading.closest('section, article') || tagHeading.parentElement;
+              for (const anchor of box?.querySelectorAll('a') || []) {
+                const href = anchor.getAttribute('href') || '';
+                if (/tag|search/i.test(href)) candidates.push(text(anchor));
+              }
+            }
+            result.tags = uniq(candidates).filter(label =>
+              label.length <= 80 && !/^(View more|Tag this mod|Manage tags)$/i.test(label)
+            );
           }
           if (!result.tags.length) {
-            result.tags = uniq([...document.querySelectorAll('a[href*="tag="][href*="skyrimspecialedition"], a[href*="tags="][href*="skyrimspecialedition"]')].map(text));
+            result.tags = uniq([...document.querySelectorAll(
+              'a[href*="tag="][href*="skyrimspecialedition"], a[href*="tags="][href*="skyrimspecialedition"]'
+            )].map(text)).filter(label => !/^(View more|Tag this mod|Manage tags)$/i.test(label));
           }
-
-          const body = document.body?.innerText || '';
-          const leafLabels = (pattern) => [...document.querySelectorAll('h1,h2,h3,h4,h5,dt,th,strong,span,p,div')]
-            .filter(element => element.children.length === 0 && pattern.test(text(element)));
-          const valueAfterLabel = (pattern) => {
-            for (const label of leafLabels(pattern)) {
-              const sibling = label.nextElementSibling;
-              if (sibling && text(sibling) && !pattern.test(text(sibling))) {
-                const time = sibling.matches('time') ? sibling : sibling.querySelector('time');
-                return time?.getAttribute('datetime') || text(sibling);
-              }
-              const parent = label.parentElement;
-              if (!parent) continue;
-              const time = parent.querySelector('time');
-              if (time) return time.getAttribute('datetime') || text(time);
-              const values = [...parent.children].map(text).filter(value => value && !pattern.test(value));
-              if (values.length) return values[0];
-            }
-            return null;
-          };
-          const normalizeDate = (value) => {
-            if (!value) return null;
-            const cleaned = clean(value);
-            const parsed = new Date(cleaned);
-            return isNaN(parsed.getTime()) ? cleaned : parsed.toISOString();
-          };
 
           result.version = clean(
             deepValue(['version', 'softwareVersion', 'currentVersion']) ||
@@ -130,8 +184,11 @@ object NexusPageParser {
             deepValue(['datePublished', 'createdAt', 'publishedAt', 'published_at']) ||
             valueAfterLabel(/^(Original upload|Uploaded|Published|Created)$/i)
           );
+          result.endorsements = parseCount(valueAfterLabel(/^Endorsements?$/i));
+          result.unique_downloads = parseCount(valueAfterLabel(/^Unique DLs?$/i));
+          result.total_downloads = parseCount(valueAfterLabel(/^Total DLs?$/i));
 
-          const scriptsText = [...document.scripts].map(s => s.textContent || '').join('\n');
+          const scriptsText = [...document.scripts].map(script => script.textContent || '').join('\n');
           const embeddedValue = (names) => {
             const expression = new RegExp('"(?:' + names.join('|') + ')"\\s*:\\s*"([^"\\\\]+)"', 'i');
             const match = scriptsText.match(expression);
@@ -162,27 +219,31 @@ object NexusPageParser {
 
           const collectFollowingLinks = (headingPattern) => {
             const output = [];
-            const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,strong')]
-              .filter(h => headingPattern.test(text(h)));
+            const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,strong,button,summary')]
+              .filter(heading => headingPattern.test(text(heading)));
             for (const heading of headings) {
               let node = heading.nextElementSibling;
               let walked = 0;
-              while (node && walked < 10) {
+              while (node && walked < 12) {
                 if (/^H[1-5]$/.test(node.tagName)) break;
                 for (const anchor of node.querySelectorAll('a[href*="/skyrimspecialedition/mods/"]')) {
                   const id = hrefId(anchor.href);
                   const name = text(anchor);
-                  if (id && id !== result.mod_id && name) output.push({mod_id:id, name:name, url:anchor.href});
+                  if (id && id !== result.mod_id && name) {
+                    output.push({mod_id:id, name:name, url:anchor.href.split('?')[0].split('#')[0]});
+                  }
                 }
                 node = node.nextElementSibling;
                 walked++;
               }
               if (!output.length) {
-                const parent = heading.parentElement;
+                const parent = heading.closest('section, article, details') || heading.parentElement;
                 for (const anchor of parent?.querySelectorAll('a[href*="/skyrimspecialedition/mods/"]') || []) {
                   const id = hrefId(anchor.href);
                   const name = text(anchor);
-                  if (id && id !== result.mod_id && name) output.push({mod_id:id, name:name, url:anchor.href});
+                  if (id && id !== result.mod_id && name) {
+                    output.push({mod_id:id, name:name, url:anchor.href.split('?')[0].split('#')[0]});
+                  }
                 }
               }
             }
@@ -191,14 +252,65 @@ object NexusPageParser {
           };
           result.requirements = collectFollowingLinks(/^Nexus requirements$/i);
           result.required_by = collectFollowingLinks(/^Mods (requiring|using) this (file|mod)(?:\s*\(\d+\))?$/i);
+          result.requirements_count = result.requirements.length;
+          result.required_by_count = result.required_by.length;
+          const requiredByHeading = [...document.querySelectorAll('h1,h2,h3,h4,h5,strong,button,summary')]
+            .map(text)
+            .find(label => /^Mods (requiring|using) this (file|mod)(?:\s*\(\d+\))?$/i.test(label));
+          const requiredByMatch = String(requiredByHeading || '').match(/\((\d[\d,]*)\)/);
+          if (requiredByMatch) {
+            result.required_by_count = Math.max(
+              result.required_by_count,
+              Number(requiredByMatch[1].replace(/,/g, ''))
+            );
+          }
 
           if (!result.mod_id) result.diagnostics.push('mod_id_missing');
           if (!result.name) result.diagnostics.push('name_missing');
+          if (!result.author) result.diagnostics.push('author_missing');
           if (!result.version) result.diagnostics.push('version_missing');
           if (!result.category) result.diagnostics.push('category_missing');
           if (!result.published_at) result.diagnostics.push('published_at_missing');
           if (!result.updated_at) result.diagnostics.push('updated_at_missing');
           return JSON.stringify(result);
+        })();
+    """.trimIndent()
+
+    val parseFilesTab: String = """
+        (function() {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const toBytes = (value) => {
+            const normalized = clean(value).replace(',', '.');
+            const match = normalized.match(/([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB|BYTE|BYTES)\b/i);
+            if (!match) return null;
+            const powers = {B:0, BYTE:0, BYTES:0, KB:1, MB:2, GB:3, TB:4};
+            return Math.round(Number(match[1]) * Math.pow(1024, powers[match[2].toUpperCase()] || 0));
+          };
+          const body = document.body?.innerText || '';
+          const start = body.search(/(?:^|\n)Main files\s*(?:\n|$)/i);
+          let segment = start >= 0 ? body.slice(start) : body;
+          const end = segment.slice(20).search(/(?:^|\n)(Updates|Optional files|Miscellaneous files|Old files|Archived files)\s*(?:\n|$)/i);
+          if (end >= 0) segment = segment.slice(0, end + 20);
+
+          const labels = [];
+          const expression = /File size\s*(?:\n|:)\s*([0-9]+(?:[.,][0-9]+)?\s*(?:B|KB|MB|GB|TB|Bytes?))/gi;
+          let match;
+          while ((match = expression.exec(segment)) !== null) labels.push(clean(match[1]));
+
+          if (!labels.length) {
+            for (const label of document.querySelectorAll('dt, th, strong, span, div')) {
+              if (label.children.length || !/^File size$/i.test(clean(label.textContent))) continue;
+              const sibling = label.nextElementSibling;
+              if (sibling) labels.push(clean(sibling.textContent));
+            }
+          }
+
+          const uniqueLabels = [...new Set(labels)];
+          const sizes = uniqueLabels.map(toBytes).filter(value => value != null && value >= 0);
+          return JSON.stringify({
+            file_size_bytes: sizes.length ? Math.max(...sizes) : null,
+            main_files_count: sizes.length
+          });
         })();
     """.trimIndent()
 
