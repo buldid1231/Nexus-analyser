@@ -125,9 +125,9 @@ class MainActivity : ComponentActivity() {
             AndroidView(
                 factory = { context ->
                     WebView(context).apply {
-                        settings.setJavaScriptEnabled(true)
-                        settings.setDomStorageEnabled(true)
-                        settings.setDatabaseEnabled(true)
+                        this.settings.javaScriptEnabled = true
+                        this.settings.domStorageEnabled = true
+                        this.settings.databaseEnabled = true
                         CookieManager.getInstance().setAcceptCookie(true)
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                         webChromeClient = WebChromeClient()
