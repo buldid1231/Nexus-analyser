@@ -6,6 +6,25 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+@Serializable
+enum class ExportMode {
+    CHANGED,
+    RANGE,
+    ALL;
+
+    val label: String
+        get() = when (this) {
+            CHANGED -> "NEW + UPDATED"
+            RANGE -> "Gewählter Zeitraum"
+            ALL -> "Gesamter Katalog"
+        }
+}
 
 @Serializable
 data class ScanSettings(
@@ -13,7 +32,7 @@ data class ScanSettings(
     val delayMs: Long = 3000L,
     val pageLimit: Int = 5,
     val chunkSize: Int = 100,
-    val exportOnlyChanged: Boolean = true
+    val exportMode: ExportMode = ExportMode.CHANGED
 ) {
     fun normalized(): ScanSettings = copy(
         rangeDays = rangeDays.coerceIn(1, 2190),
@@ -52,6 +71,25 @@ object RangeClassifier {
 
     private fun parseInstant(value: String?): Instant? {
         if (value.isNullOrBlank()) return null
-        return runCatching { Instant.parse(value) }.getOrNull()
+        runCatching { return Instant.parse(value) }
+        runCatching { return OffsetDateTime.parse(value).toInstant() }
+
+        val normalized = value.trim().replace(
+            Regex("(?i)(\\d)(AM|PM)$")
+        ) { match -> "${match.groupValues[1]} ${match.groupValues[2]}" }
+        val patterns = listOf(
+            "d MMMM yyyy, h:mma",
+            "d MMMM yyyy, h:mm a",
+            "d MMM yyyy, h:mma",
+            "d MMM yyyy, h:mm a"
+        )
+        for (pattern in patterns) {
+            val parsed = runCatching {
+                LocalDateTime.parse(normalized, DateTimeFormatter.ofPattern(pattern, Locale.ENGLISH))
+                    .toInstant(ZoneOffset.UTC)
+            }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        return null
     }
 }

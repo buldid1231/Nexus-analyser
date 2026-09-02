@@ -26,9 +26,16 @@ class Repository(private val dao: ModDao) {
             val previous = dao.byId(r.mod_id)
             val signal = (r.name + " " + r.summary.orEmpty() + " " + r.tags.joinToString(" ")).lowercase()
             ModEntity(
-                modId = r.mod_id, name = r.name, author = r.author, version = r.version,
-                category = r.category, summary = r.summary, publishedAt = r.published_at,
-                updatedAt = r.updated_at, adult = r.adult, nexusUrl = r.url,
+                modId = r.mod_id,
+                name = r.name.ifBlank { previous?.name.orEmpty() },
+                author = r.author ?: previous?.author,
+                version = r.version ?: previous?.version,
+                category = r.category ?: previous?.category,
+                summary = r.summary ?: previous?.summary,
+                publishedAt = r.published_at ?: previous?.publishedAt,
+                updatedAt = r.updated_at ?: previous?.updatedAt,
+                adult = r.adult || previous?.adult == true,
+                nexusUrl = r.url ?: previous?.nexusUrl,
                 firstSeenAt = previous?.firstSeenAt ?: now, lastSeenAt = now,
                 hasSkseHint = "skse" in signal,
                 hasDllHint = ".dll" in signal || r.tags.any { it.equals("dll", true) },
@@ -80,7 +87,7 @@ class Repository(private val dao: ModDao) {
             }
             json.encodeToString(
                 ImportChunk(
-                    schema_version = 6,
+                    schema_version = 7,
                     generated_at = Instant.now().toString(),
                     chunk = index + 1,
                     chunk_size = size,

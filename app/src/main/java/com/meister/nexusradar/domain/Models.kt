@@ -27,7 +27,7 @@ data class NexusModRecord(
 
 @Serializable
 data class ImportChunk(
-    val schema_version: Int = 6,
+    val schema_version: Int = 7,
     val game: String = "skyrimspecialedition",
     val generated_at: String,
     val scan_started_at: String? = null,
