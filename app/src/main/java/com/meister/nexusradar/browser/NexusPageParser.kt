@@ -25,8 +25,8 @@ object NexusPageParser {
           const ld = [...document.querySelectorAll('script[type="application/ld+json"]')].map(x => {
             try { return JSON.parse(x.textContent); } catch(e) { return null; }
           }).filter(Boolean);
-          const metas = (p) => document.querySelector(`meta[property="${p}"]`)?.content || null;
-          const named = (n) => document.querySelector(`meta[name="${n}"]`)?.content || null;
+          const metas = (p) => document.querySelector('meta[property="' + p + '"]')?.content || null;
+          const named = (n) => document.querySelector('meta[name="' + n + '"]')?.content || null;
 
           result.name = text(document.querySelector('h1')) || metas('og:title') || document.title.replace(/ at Skyrim Special Edition Nexus.*$/i,'').trim();
           result.summary = named('description') || metas('og:description') || null;
