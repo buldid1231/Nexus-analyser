@@ -1,7 +1,9 @@
 package com.meister.nexusradar.data
 
 import androidx.room.Entity
+import kotlinx.serialization.Serializable
 
+@Serializable
 @Entity(tableName = "mods")
 data class ModEntity(
     @androidx.room.PrimaryKey val modId: Long,
@@ -30,6 +32,7 @@ data class ModEntity(
     val diagnostics: String = ""
 )
 
+@Serializable
 @Entity(tableName = "dependencies", primaryKeys = ["ownerModId", "relatedModId", "relationType"])
 data class DependencyEntity(
     val ownerModId: Long,
@@ -39,5 +42,13 @@ data class DependencyEntity(
     val relationType: String
 )
 
+@Serializable
 @Entity(tableName = "tags", primaryKeys = ["modId", "tag"])
 data class TagEntity(val modId: Long, val tag: String)
+
+@Serializable
+data class CatalogSnapshot(
+    val mods: List<ModEntity> = emptyList(),
+    val dependencies: List<DependencyEntity> = emptyList(),
+    val tags: List<TagEntity> = emptyList()
+)

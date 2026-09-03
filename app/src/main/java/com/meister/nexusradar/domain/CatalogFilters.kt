@@ -2,7 +2,9 @@ package com.meister.nexusradar.domain
 
 import com.meister.nexusradar.data.ModEntity
 import com.meister.nexusradar.settings.NexusDateParser
+import kotlinx.serialization.Serializable
 
+@Serializable
 enum class CatalogSort(val label: String) {
     UPDATED_DESC("Neueste Updates"),
     UPDATED_ASC("Alte Updates zuerst"),
@@ -13,6 +15,7 @@ enum class CatalogSort(val label: String) {
     DOWNLOADS_DESC("Meiste Downloads")
 }
 
+@Serializable
 enum class SizeFilter(val label: String) {
     ALL("Alle Größen"),
     UNDER_10_MB("Unter 10 MB"),
@@ -22,6 +25,7 @@ enum class SizeFilter(val label: String) {
     UNKNOWN("Größe unbekannt")
 }
 
+@Serializable
 data class CatalogFilterState(
     val selectedCategories: Set<String> = emptySet(),
     val selectedStates: Set<String> = setOf("NEW", "UPDATED", "UNCHANGED", "DISCOVERED"),

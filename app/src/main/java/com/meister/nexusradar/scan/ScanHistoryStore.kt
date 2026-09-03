@@ -72,9 +72,13 @@ class ScanHistoryStore(context: Context) {
 
     fun add(summary: ScanRunSummary) {
         val updated = (listOf(summary) + load().filterNot { it.id == summary.id }).take(MAX_RUNS)
+        replaceAll(updated)
+    }
+
+    fun replaceAll(runs: List<ScanRunSummary>) {
         prefs.edit().putString(
             KEY_HISTORY,
-            json.encodeToString(PersistedScanHistory(updated))
+            json.encodeToString(PersistedScanHistory(runs.distinctBy { it.id }.take(MAX_RUNS)))
         ).apply()
     }
 

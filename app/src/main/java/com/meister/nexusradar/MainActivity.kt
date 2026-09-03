@@ -2,6 +2,7 @@ package com.meister.nexusradar
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -39,7 +40,11 @@ import com.meister.nexusradar.data.ModEntity
 import com.meister.nexusradar.domain.*
 import com.meister.nexusradar.scan.*
 import com.meister.nexusradar.settings.*
+import com.meister.nexusradar.transfer.AppBackupPayload
+import com.meister.nexusradar.transfer.TransferArchives
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.time.Instant
 import java.time.ZoneId
@@ -56,11 +61,29 @@ private val RadarColors = darkColorScheme(
     outline = Color(0xFF777985)
 )
 
+private data class ShareableDocument(
+    val uri: Uri,
+    val name: String,
+    val mimeType: String = "application/zip"
+)
+
+private data class StoredTransfer(
+    val document: ShareableDocument,
+    val message: String
+)
+
+private data class BackupRestoreResult(
+    val mods: Int,
+    val reports: Int,
+    val queued: Int
+)
+
 class MainActivity : ComponentActivity() {
     private lateinit var repo: Repository
     private lateinit var scanStore: ScanStateStore
     private lateinit var historyStore: ScanHistoryStore
     private lateinit var settingsStore: ScanSettingsStore
+    private lateinit var filterStore: CatalogFilterStore
     private lateinit var exportStore: ExportDestinationStore
     private val requestedScreen = mutableIntStateOf(0)
     private val json = Json { ignoreUnknownKeys = true }
@@ -71,6 +94,7 @@ class MainActivity : ComponentActivity() {
         scanStore = ScanStateStore(this)
         historyStore = ScanHistoryStore(this)
         settingsStore = ScanSettingsStore(this)
+        filterStore = CatalogFilterStore(this)
         exportStore = ExportDestinationStore(this)
         requestedScreen.intValue = intent.getIntExtra(EXTRA_OPEN_SCREEN, 0).coerceIn(0, 4)
         val interruptedState = scanStore.load()
@@ -104,6 +128,9 @@ class MainActivity : ComponentActivity() {
         var screen by rememberSaveable { mutableIntStateOf(requestedScreen.intValue) }
         var scanStatus by remember { mutableStateOf("Bereit") }
         var exportStatus by remember { mutableStateOf("Noch kein Export ausgeführt") }
+        var transferBusy by remember { mutableStateOf(false) }
+        var lastShareable by remember { mutableStateOf<ShareableDocument?>(null) }
+        var pendingBackupRestore by remember { mutableStateOf<Uri?>(null) }
         var address by remember {
             mutableStateOf("https://www.nexusmods.com/games/skyrimspecialedition/mods")
         }
@@ -113,10 +140,14 @@ class MainActivity : ComponentActivity() {
         val scanHistory by scanHistoryFlow.collectAsState(initial = historyStore.load())
         var settings by remember { mutableStateOf(settingsStore.load()) }
         var exportUri by remember { mutableStateOf(exportStore.load()) }
-        var catalogFilters by remember { mutableStateOf(CatalogFilterState()) }
+        var catalogFilters by remember { mutableStateOf(filterStore.load()) }
         val mods by repo.observeMods().collectAsState(initial = emptyList())
         val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
         val scope = rememberCoroutineScope()
+        val updateCatalogFilters: (CatalogFilterState) -> Unit = { updated ->
+            catalogFilters = updated
+            filterStore.save(updated)
+        }
 
         LaunchedEffect(requestedScreen.intValue) {
             screen = requestedScreen.intValue
@@ -140,19 +171,32 @@ class MainActivity : ComponentActivity() {
         }
 
         val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri != null) {
+            if (uri != null && !transferBusy) {
                 lifecycleScope.launch {
-                    runCatching {
-                        contentResolver.openInputStream(uri)?.bufferedReader()?.use {
-                            repo.importJson(it.readText())
-                        } ?: error("Datei konnte nicht geöffnet werden")
-                    }.onSuccess {
-                        exportStatus = "Importiert: ${it.accepted} • ausgeschlossen: ${it.rejected}"
-                    }.onFailure {
-                        exportStatus = "Importfehler: ${it.message ?: "unbekannt"}"
+                    transferBusy = true
+                    try {
+                        runCatching {
+                            withContext(Dispatchers.IO) {
+                                contentResolver.openInputStream(uri)?.bufferedReader()?.use {
+                                    repo.importJson(it.readText())
+                                } ?: error("Datei konnte nicht geöffnet werden")
+                            }
+                        }.onSuccess {
+                            exportStatus = "Importiert: ${it.accepted} • ausgeschlossen: ${it.rejected}"
+                        }.onFailure {
+                            exportStatus = "Importfehler: ${it.message ?: "unbekannt"}"
+                        }
+                    } finally {
+                        transferBusy = false
                     }
                 }
             }
+        }
+
+        val backupImporter = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
+            if (uri != null && !transferBusy) pendingBackupRestore = uri
         }
 
         val exportDirectoryPicker = rememberLauncherForActivityResult(
@@ -180,6 +224,48 @@ class MainActivity : ComponentActivity() {
                 ?: "Kein Exportordner gewählt"
         }
 
+        if (pendingBackupRestore != null) {
+            AlertDialog(
+                onDismissRequest = { pendingBackupRestore = null },
+                title = { Text("Vollbackup wiederherstellen?") },
+                text = {
+                    Text(
+                        "Das Backup wird zuerst vollständig geprüft. Danach ersetzt es Katalog, " +
+                            "Abhängigkeiten, Tags, Einstellungen, Filter, Queue und Scanberichte."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val restoreUri = pendingBackupRestore
+                        pendingBackupRestore = null
+                        if (restoreUri != null) {
+                            lifecycleScope.launch {
+                                transferBusy = true
+                                exportStatus = "Backup wird geprüft …"
+                                try {
+                                    runCatching { restoreBackup(restoreUri) }
+                                        .onSuccess { result ->
+                                            settings = settingsStore.load()
+                                            catalogFilters = filterStore.load()
+                                            exportStatus = "Backup wiederhergestellt: ${result.mods} Mods • " +
+                                                "${result.reports} Berichte • ${result.queued} Queue-Mods"
+                                        }
+                                        .onFailure { error ->
+                                            exportStatus = "Backupfehler: ${error.message ?: "Datei ist ungültig"}"
+                                        }
+                                } finally {
+                                    transferBusy = false
+                                }
+                            }
+                        }
+                    }) { Text("Prüfen und ersetzen") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingBackupRestore = null }) { Text("Abbrechen") }
+                }
+            )
+        }
+
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
@@ -192,8 +278,8 @@ class MainActivity : ComponentActivity() {
                         },
                         mods = mods,
                         filters = catalogFilters,
-                        updateFilters = { catalogFilters = it },
-                        resetFilters = { catalogFilters = CatalogFilterState() }
+                        updateFilters = updateCatalogFilters,
+                        resetFilters = { updateCatalogFilters(CatalogFilterState()) }
                     )
                 }
             }
@@ -212,7 +298,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Berichte", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.14", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.15", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -253,7 +339,7 @@ class MainActivity : ComponentActivity() {
                         1 -> CatalogPane(
                             mods = mods,
                             filters = catalogFilters,
-                            updateFilters = { catalogFilters = it },
+                            updateFilters = updateCatalogFilters,
                             openFilters = { scope.launch { drawerState.open() } }
                         )
                         2 -> ReportsPane(
@@ -294,6 +380,9 @@ class MainActivity : ComponentActivity() {
                             mods = mods,
                             status = exportStatus,
                             settings = settings,
+                            transferBusy = transferBusy,
+                            scannerBusy = scanState.running || scanState.collecting,
+                            lastShareName = lastShareable?.name,
                             updateSettings = {
                                 settings = it.normalized()
                                 settingsStore.save(settings)
@@ -303,18 +392,75 @@ class MainActivity : ComponentActivity() {
                             importClick = {
                                 importer.launch(arrayOf("application/json", "text/plain"))
                             },
-                            exportClick = {
+                            restoreBackupClick = {
+                                backupImporter.launch(arrayOf("application/zip", "application/octet-stream"))
+                            },
+                            shareClick = {
+                                lastShareable?.let(::shareDocument)
+                            },
+                            zipExportClick = {
                                 val target = exportUri
                                 if (target == null) {
                                     exportStatus = "Bitte zuerst einen Exportordner wählen"
                                 } else {
                                     lifecycleScope.launch {
-                                        exportStatus = "Export läuft …"
-                                        runCatching { export(target, settings) }
-                                            .onSuccess { exportStatus = it }
-                                            .onFailure {
-                                                exportStatus = "Exportfehler: ${it.message ?: "Schreibzugriff fehlgeschlagen"}"
-                                            }
+                                        transferBusy = true
+                                        exportStatus = "ZIP-Export wird erstellt und geprüft …"
+                                        try {
+                                            runCatching { exportVerifiedZip(target, settings) }
+                                                .onSuccess { result ->
+                                                    lastShareable = result.document
+                                                    exportStatus = result.message
+                                                }
+                                                .onFailure { error ->
+                                                    exportStatus = "ZIP-Exportfehler: ${error.message ?: "Schreibzugriff fehlgeschlagen"}"
+                                                }
+                                        } finally {
+                                            transferBusy = false
+                                        }
+                                    }
+                                }
+                            },
+                            jsonExportClick = {
+                                val target = exportUri
+                                if (target == null) {
+                                    exportStatus = "Bitte zuerst einen Exportordner wählen"
+                                } else {
+                                    lifecycleScope.launch {
+                                        transferBusy = true
+                                        exportStatus = "Einzelne JSON-Dateien werden geschrieben und geprüft …"
+                                        try {
+                                            runCatching { exportJsonFiles(target, settings) }
+                                                .onSuccess { exportStatus = it }
+                                                .onFailure { error ->
+                                                    exportStatus = "JSON-Exportfehler: ${error.message ?: "Schreibzugriff fehlgeschlagen"}"
+                                                }
+                                        } finally {
+                                            transferBusy = false
+                                        }
+                                    }
+                                }
+                            },
+                            createBackupClick = {
+                                val target = exportUri
+                                if (target == null) {
+                                    exportStatus = "Bitte zuerst einen Zielordner wählen"
+                                } else {
+                                    lifecycleScope.launch {
+                                        transferBusy = true
+                                        exportStatus = "Vollbackup wird erstellt und geprüft …"
+                                        try {
+                                            runCatching { createVerifiedBackup(target) }
+                                                .onSuccess { result ->
+                                                    lastShareable = result.document
+                                                    exportStatus = result.message
+                                                }
+                                                .onFailure { error ->
+                                                    exportStatus = "Backupfehler: ${error.message ?: "Backup konnte nicht erstellt werden"}"
+                                                }
+                                        } finally {
+                                            transferBusy = false
+                                        }
                                     }
                                 }
                             }
@@ -355,7 +501,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.14 • lokaler Mod-Katalog",
+                    "v0.15 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -1412,11 +1558,18 @@ class MainActivity : ComponentActivity() {
         mods: List<ModEntity>,
         status: String,
         settings: ScanSettings,
+        transferBusy: Boolean,
+        scannerBusy: Boolean,
+        lastShareName: String?,
         updateSettings: (ScanSettings) -> Unit,
         folderName: String,
         chooseFolder: () -> Unit,
         importClick: () -> Unit,
-        exportClick: () -> Unit
+        restoreBackupClick: () -> Unit,
+        shareClick: () -> Unit,
+        zipExportClick: () -> Unit,
+        jsonExportClick: () -> Unit,
+        createBackupClick: () -> Unit
     ) {
         var chunkText by remember(settings.chunkSize) {
             mutableStateOf(settings.chunkSize.toString())
@@ -1428,16 +1581,27 @@ class MainActivity : ComponentActivity() {
             ExportMode.RANGE -> mods.count { it.inSelectedRange }
             ExportMode.ALL -> mods.size
         }
+        val hasFolder = folderName != "Kein Exportordner gewählt"
+        val locked = transferBusy || scannerBusy
 
         Column(
             Modifier.fillMaxSize().padding(12.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text(
-                "JSON-Dateien",
+                "Export & Backup",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold
             )
+            if (scannerBusy) {
+                ElevatedCard(Modifier.fillMaxWidth()) {
+                    Text(
+                        "Der Scanner läuft. Export und Wiederherstellung werden freigegeben, sobald der Katalog wieder in einem festen Zustand ist.",
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
             SectionCard("1. Exportumfang") {
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -1487,17 +1651,72 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Ordner wählen oder ändern") }
             }
-            Button(
-                onClick = exportClick,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = exportableCount > 0 && folderName != "Kein Exportordner gewählt"
-            ) {
-                Text("Jetzt $exportableCount Mods exportieren")
+            SectionCard("4. Geprüfter Export") {
+                Text(
+                    "Das ZIP enthält die JSON-Chunks und ein Manifest mit Dateigrößen und SHA-256-Prüfsummen. Nach dem Schreiben wird alles erneut aus dem Zielordner gelesen und kontrolliert.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Button(
+                    onClick = zipExportClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = exportableCount > 0 && hasFolder && !locked
+                ) {
+                    Text("Geprüftes ZIP mit $exportableCount Mods erstellen")
+                }
+                OutlinedButton(
+                    onClick = jsonExportClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = exportableCount > 0 && hasFolder && !locked
+                ) {
+                    Text("JSON-Chunks einzeln speichern")
+                }
+                if (lastShareName != null) {
+                    OutlinedButton(
+                        onClick = shareClick,
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !transferBusy
+                    ) {
+                        Text("Letzte ZIP-Datei teilen")
+                    }
+                    Text(
+                        lastShareName,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            OutlinedButton(
-                onClick = importClick,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("JSON-Datei importieren") }
+            SectionCard("5. Vollständiges App-Datenbackup") {
+                Text(
+                    "Sichert Katalog, Abhängigkeiten, Tags, Einstellungen, Katalogfilter, Scan-Queue und Berichte in einer einzigen geprüften ZIP-Datei.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Button(
+                    onClick = createBackupClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = hasFolder && !locked
+                ) { Text("Vollbackup erstellen") }
+                OutlinedButton(
+                    onClick = restoreBackupClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !locked
+                ) { Text("Vollbackup wiederherstellen") }
+                Text(
+                    "Nexus-Anmeldung und Android-Ordnerrechte werden bewusst nicht gesichert. Nach einer Neuinstallation bitte erneut anmelden und den Zielordner auswählen.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            SectionCard("6. Einzelne JSON-Datei importieren") {
+                OutlinedButton(
+                    onClick = importClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !locked
+                ) { Text("JSON-Chunk importieren") }
+            }
+            if (transferBusy) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Text(status, modifier = Modifier.padding(12.dp))
             }
@@ -1525,47 +1744,178 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun export(tree: Uri, settings: ScanSettings): String {
-        val onlyInRange = settings.exportMode != ExportMode.ALL
-        val onlyChanged = settings.exportMode == ExportMode.CHANGED
+    private suspend fun exportVerifiedZip(tree: Uri, settings: ScanSettings): StoredTransfer =
+        withContext(Dispatchers.IO) {
+            val chunks = exportChunks(settings)
+            val directory = writableDirectory(tree)
+            val timestamp = transferTimestamp()
+            val modeName = settings.exportMode.name.lowercase()
+            val requestedName = "skyrimse_${modeName}_${settings.rangeDays}d_${timestamp}.zip"
+            val file = directory.createFile("application/zip", requestedName)
+                ?: error("ZIP-Datei konnte nicht angelegt werden")
+            try {
+                val output = contentResolver.openOutputStream(file.uri, "w")
+                    ?: error("ZIP-Datei konnte nicht geöffnet werden")
+                val written = TransferArchives.writeExport(
+                    output = output,
+                    chunks = chunks,
+                    appVersion = APP_VERSION,
+                    exportMode = settings.exportMode.name,
+                    rangeDays = settings.rangeDays
+                )
+                val input = contentResolver.openInputStream(file.uri)
+                    ?: error("ZIP-Datei konnte zur Prüfung nicht gelesen werden")
+                val verified = TransferArchives.verifyExport(input)
+                require(written == verified) { "Manifest stimmt nach dem Schreiben nicht überein" }
+                val actualName = file.getName() ?: requestedName
+                StoredTransfer(
+                    document = ShareableDocument(file.uri, actualName),
+                    message = "✓ ZIP geprüft: ${verified.total_mods} Mods • " +
+                        "${verified.chunk_count} Chunks • $actualName"
+                )
+            } catch (error: Exception) {
+                file.delete()
+                throw error
+            }
+        }
+
+    private suspend fun exportJsonFiles(tree: Uri, settings: ScanSettings): String =
+        withContext(Dispatchers.IO) {
+            val chunks = exportChunks(settings)
+            val directory = writableDirectory(tree)
+            val timestamp = transferTimestamp()
+            val modeName = settings.exportMode.name.lowercase()
+            val created = mutableListOf<DocumentFile>()
+            try {
+                chunks.forEachIndexed { index, contents ->
+                    val name = "skyrimse_${modeName}_${settings.rangeDays}d_${timestamp}_chunk_" +
+                        (index + 1).toString().padStart(4, '0') + ".json"
+                    val file = directory.createFile("application/json", name)
+                        ?: error("Datei $name konnte nicht angelegt werden")
+                    created += file
+                    val stream = contentResolver.openOutputStream(file.uri, "w")
+                        ?: error("Datei $name konnte nicht geöffnet werden")
+                    stream.bufferedWriter(Charsets.UTF_8).use { it.write(contents) }
+                    val readBack = contentResolver.openInputStream(file.uri)?.bufferedReader()?.use {
+                        it.readText()
+                    } ?: error("Datei $name konnte nicht zurückgelesen werden")
+                    require(readBack == contents) { "Rückleseprüfung fehlgeschlagen: $name" }
+                    val parsed = json.decodeFromString<ImportChunk>(readBack)
+                    require(parsed.chunk == index + 1 && parsed.schema_version == 8) {
+                        "JSON-Prüfung fehlgeschlagen: $name"
+                    }
+                }
+                "✓ ${created.size} JSON-Dateien geschrieben und zurückgelesen • " +
+                    (directory.getName() ?: "Zielordner")
+            } catch (error: Exception) {
+                created.forEach { it.delete() }
+                throw error
+            }
+        }
+
+    private suspend fun createVerifiedBackup(tree: Uri): StoredTransfer =
+        withContext(Dispatchers.IO) {
+            val currentScan = scanStore.load()
+            require(!currentScan.running && !currentScan.collecting) {
+                "Bitte den laufenden Scan zuerst pausieren"
+            }
+            val createdAt = Instant.now().toString()
+            val backup = AppBackupPayload(
+                app_version = APP_VERSION,
+                created_at = createdAt,
+                settings = settingsStore.load(),
+                catalog_filters = filterStore.load(),
+                scan_state = currentScan.copy(running = false, collecting = false),
+                scan_history = historyStore.load(),
+                catalog = repo.catalogSnapshot()
+            )
+            val directory = writableDirectory(tree)
+            val requestedName = "NexusSkyrimRadar_backup_${transferTimestamp()}.zip"
+            val file = directory.createFile("application/zip", requestedName)
+                ?: error("Backupdatei konnte nicht angelegt werden")
+            try {
+                val output = contentResolver.openOutputStream(file.uri, "w")
+                    ?: error("Backupdatei konnte nicht geöffnet werden")
+                val written = TransferArchives.writeBackup(output, backup)
+                val input = contentResolver.openInputStream(file.uri)
+                    ?: error("Backupdatei konnte zur Prüfung nicht gelesen werden")
+                val verified = TransferArchives.readBackup(input)
+                require(verified.catalog.mods.size == written.mod_count) {
+                    "Backup stimmt nach dem Schreiben nicht überein"
+                }
+                val actualName = file.getName() ?: requestedName
+                StoredTransfer(
+                    document = ShareableDocument(file.uri, actualName),
+                    message = "✓ Vollbackup geprüft: ${written.mod_count} Mods • " +
+                        "${written.report_count} Berichte • $actualName"
+                )
+            } catch (error: Exception) {
+                file.delete()
+                throw error
+            }
+        }
+
+    private suspend fun restoreBackup(uri: Uri): BackupRestoreResult = withContext(Dispatchers.IO) {
+        val currentScan = scanStore.load()
+        require(!currentScan.running && !currentScan.collecting) {
+            "Ein laufender Scan kann nicht überschrieben werden"
+        }
+        val input = contentResolver.openInputStream(uri)
+            ?: error("Backupdatei konnte nicht geöffnet werden")
+        val backup = TransferArchives.readBackup(input)
+        repo.restoreCatalog(backup.catalog)
+        settingsStore.save(backup.settings)
+        filterStore.save(backup.catalog_filters)
+        val restoredState = backup.scan_state.copy(
+            running = false,
+            collecting = false,
+            statusMessage = "Backup wiederhergestellt • ${backup.scan_state.queue.size} Queue-Mods bereit"
+        )
+        scanStore.save(restoredState)
+        historyStore.replaceAll(backup.scan_history)
+        BackupRestoreResult(
+            mods = backup.catalog.mods.size,
+            reports = backup.scan_history.size,
+            queued = restoredState.queue.size
+        )
+    }
+
+    private suspend fun exportChunks(settings: ScanSettings): List<String> {
         val chunks = repo.exportChunks(
             chunkSize = settings.chunkSize,
-            onlyInRange = onlyInRange,
-            onlyChanged = onlyChanged,
+            onlyInRange = settings.exportMode != ExportMode.ALL,
+            onlyChanged = settings.exportMode == ExportMode.CHANGED,
             rangeDays = settings.rangeDays,
             scanStartedAt = scanStore.load().startedAt
         )
         require(chunks.isNotEmpty()) {
             "Für den gewählten Exportumfang sind keine Mods vorhanden"
         }
+        return chunks
+    }
 
+    private fun writableDirectory(tree: Uri): DocumentFile {
         val directory = DocumentFile.fromTreeUri(this, tree)
             ?: error("Der Zielordner ist nicht mehr verfügbar")
         require(directory.exists() && directory.isDirectory) {
             "Der Zielordner existiert nicht mehr"
         }
-        require(directory.canWrite()) {
-            "Für den Zielordner fehlt die Schreibberechtigung"
-        }
+        require(directory.canWrite()) { "Für den Zielordner fehlt die Schreibberechtigung" }
+        return directory
+    }
 
-        val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")
-            .withZone(ZoneOffset.UTC)
-            .format(Instant.now())
-        val modeName = settings.exportMode.name.lowercase()
-        var written = 0
-        chunks.forEachIndexed { index, contents ->
-            val name = "skyrimse_${modeName}_${settings.rangeDays}d_${timestamp}_chunk_" +
-                (index + 1).toString().padStart(4, '0') + ".json"
-            val file = directory.createFile("application/json", name)
-                ?: error("Datei $name konnte nicht angelegt werden")
-            val stream = contentResolver.openOutputStream(file.uri, "w")
-                ?: error("Datei $name konnte nicht geöffnet werden")
-            stream.bufferedWriter(Charsets.UTF_8).use { writer ->
-                writer.write(contents)
-            }
-            written++
+    private fun transferTimestamp(): String = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")
+        .withZone(ZoneOffset.UTC)
+        .format(Instant.now())
+
+    private fun shareDocument(document: ShareableDocument) {
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = document.mimeType
+            putExtra(Intent.EXTRA_STREAM, document.uri)
+            clipData = ClipData.newRawUri(document.name, document.uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        return "$written JSON-Dateien gespeichert in ${directory.getName() ?: "Zielordner"}"
+        startActivity(Intent.createChooser(sendIntent, "${document.name} teilen"))
     }
 
     private fun displayDate(value: String?): String =
@@ -1615,6 +1965,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_OPEN_SCREEN = "open_screen"
+        private const val APP_VERSION = "0.15.0"
         private const val MAX_VISIBLE_REPORT_ERRORS = 10
     }
 

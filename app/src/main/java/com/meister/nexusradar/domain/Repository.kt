@@ -15,6 +15,28 @@ class Repository(private val dao: ModDao) {
 
     fun observeMods(): Flow<List<ModEntity>> = dao.observeAll()
 
+    suspend fun catalogSnapshot(): CatalogSnapshot = CatalogSnapshot(
+        mods = dao.allMods(),
+        dependencies = dao.allDependencies(),
+        tags = dao.allTags()
+    )
+
+    suspend fun restoreCatalog(snapshot: CatalogSnapshot) {
+        val modIds = snapshot.mods.map { it.modId }
+        require(modIds.size == modIds.distinct().size) { "Backup enthält doppelte Mod-IDs" }
+        require(snapshot.mods.all { it.modId > 0 && it.name.isNotBlank() }) {
+            "Backup enthält ungültige Mods"
+        }
+        val knownIds = modIds.toSet()
+        require(snapshot.dependencies.all { it.ownerModId in knownIds }) {
+            "Backup enthält Abhängigkeiten ohne zugehörigen Mod"
+        }
+        require(snapshot.tags.all { it.modId in knownIds }) {
+            "Backup enthält Tags ohne zugehörigen Mod"
+        }
+        dao.replaceCatalog(snapshot)
+    }
+
     suspend fun planListingScan(links: List<VisibleLink>): ListingScanPlan {
         if (links.isEmpty()) return ListingScanPlan(emptyList(), 0, 0, 0)
         val previousById = links.map { it.mod_id }.distinct().chunked(500)
