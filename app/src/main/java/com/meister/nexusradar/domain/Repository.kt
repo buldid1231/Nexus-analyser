@@ -3,6 +3,7 @@ package com.meister.nexusradar.domain
 import com.meister.nexusradar.data.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.json.Json
+import java.time.Duration
 import java.time.Instant
 
 class Repository(private val dao: ModDao) {
@@ -95,8 +96,17 @@ class Repository(private val dao: ModDao) {
         return ImportResult(accepted.size, rejected)
     }
 
-    suspend fun exportChunks(chunkSize: Int = 100, onlyInRange: Boolean = true, onlyChanged: Boolean = true): List<String> {
+    suspend fun exportChunks(
+        chunkSize: Int = 100,
+        onlyInRange: Boolean = true,
+        onlyChanged: Boolean = true,
+        rangeDays: Int = 14,
+        scanStartedAt: String? = null
+    ): List<String> {
         val size = chunkSize.coerceIn(10, 500)
+        val generatedAt = Instant.now()
+        val rangeEnd = generatedAt.toString()
+        val rangeStart = generatedAt.minus(Duration.ofDays(rangeDays.coerceIn(1, 2190).toLong())).toString()
         val total = when {
             onlyInRange && onlyChanged -> dao.countChangedInRange()
             onlyInRange -> dao.countInRange()
@@ -137,7 +147,10 @@ class Repository(private val dao: ModDao) {
             json.encodeToString(
                 ImportChunk(
                     schema_version = 8,
-                    generated_at = Instant.now().toString(),
+                    generated_at = generatedAt.toString(),
+                    scan_started_at = scanStartedAt,
+                    range_start = rangeStart,
+                    range_end = rangeEnd,
                     chunk = index + 1,
                     chunk_size = size,
                     mods = records

@@ -264,6 +264,15 @@ object NexusPageParser {
               Number(requiredByMatch[1].replace(/,/g, ''))
             );
           }
+          const requiredByBodyMatch = body.match(
+            /Mods (?:requiring|using) this (?:file|mod)\s*\(([\d,]+)\)/i
+          );
+          if (requiredByBodyMatch) {
+            result.required_by_count = Math.max(
+              result.required_by_count,
+              Number(requiredByBodyMatch[1].replace(/,/g, ''))
+            );
+          }
 
           if (!result.mod_id) result.diagnostics.push('mod_id_missing');
           if (!result.name) result.diagnostics.push('name_missing');

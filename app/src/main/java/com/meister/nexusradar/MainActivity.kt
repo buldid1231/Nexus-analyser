@@ -166,7 +166,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.9", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.10", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -279,7 +279,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.9 • lokaler Mod-Katalog",
+                    "v0.10 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -638,6 +638,10 @@ class MainActivity : ComponentActivity() {
             onDone?.invoke(false)
             return
         }
+        val persisted = scanStore.load()
+        if (persisted.startedAt == null) {
+            scanStore.save(persisted.copy(startedAt = Instant.now().toString()))
+        }
         lifecycleScope.launch {
             val success = scanCurrentPage(web, settings, setStatus, expectedId = null)
             onDone?.invoke(success)
@@ -690,7 +694,8 @@ class MainActivity : ComponentActivity() {
         var state = initial.copy(
             running = true,
             delayMs = settings.delayMs,
-            startedWith = initial.queue.size + initial.processedIds.size
+            startedWith = initial.queue.size + initial.processedIds.size,
+            startedAt = initial.startedAt ?: Instant.now().toString()
         )
         setState(state)
         lifecycleScope.launch {
@@ -1411,7 +1416,9 @@ class MainActivity : ComponentActivity() {
         val chunks = repo.exportChunks(
             chunkSize = settings.chunkSize,
             onlyInRange = onlyInRange,
-            onlyChanged = onlyChanged
+            onlyChanged = onlyChanged,
+            rangeDays = settings.rangeDays,
+            scanStartedAt = scanStore.load().startedAt
         )
         require(chunks.isNotEmpty()) {
             "Für den gewählten Exportumfang sind keine Mods vorhanden"

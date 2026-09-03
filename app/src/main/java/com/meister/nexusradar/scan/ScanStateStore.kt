@@ -13,6 +13,7 @@ import kotlinx.serialization.json.Json
     val lastUrl: String? = null,
     val delayMs: Long = 3000L,
     val startedWith: Int = 0,
+    val startedAt: String? = null,
     val failedIds: Set<Long> = emptySet()
 ) {
     val processedCount: Int get() = processedIds.size
