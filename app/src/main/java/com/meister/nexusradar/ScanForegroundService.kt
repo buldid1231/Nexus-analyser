@@ -24,11 +24,14 @@ import com.meister.nexusradar.domain.Repository
 import com.meister.nexusradar.domain.VisibleLink
 import com.meister.nexusradar.domain.VisibleLinksResult
 import com.meister.nexusradar.scan.NexusModScanner
+import com.meister.nexusradar.scan.FailedScanItem
 import com.meister.nexusradar.scan.PersistedScanState
 import com.meister.nexusradar.scan.QueueOrdering
 import com.meister.nexusradar.scan.QueueItem
 import com.meister.nexusradar.scan.ScanAttemptOutcome
+import com.meister.nexusradar.scan.ScanHistoryStore
 import com.meister.nexusradar.scan.ScanRetryPolicy
+import com.meister.nexusradar.scan.ScanRunSummary
 import com.meister.nexusradar.scan.ScanStateStore
 import com.meister.nexusradar.settings.ScanSettings
 import com.meister.nexusradar.settings.ScanSettingsStore
@@ -56,6 +59,7 @@ class ScanForegroundService : Service() {
     private val json = Json { ignoreUnknownKeys = true }
     private lateinit var repository: Repository
     private lateinit var scanStore: ScanStateStore
+    private lateinit var historyStore: ScanHistoryStore
     private lateinit var settingsStore: ScanSettingsStore
     private lateinit var notificationManager: NotificationManager
     private var scanJob: Job? = null
@@ -66,6 +70,7 @@ class ScanForegroundService : Service() {
         super.onCreate()
         repository = Repository(AppDatabase.get(this).modDao())
         scanStore = ScanStateStore(this)
+        historyStore = ScanHistoryStore(this)
         settingsStore = ScanSettingsStore(this)
         notificationManager = getSystemService(NotificationManager::class.java)
         createNotificationChannels()
@@ -404,6 +409,20 @@ class ScanForegroundService : Service() {
                 } else {
                     latest.failedMessages - item.modId
                 },
+                failedItems = if (result.outcome == ScanAttemptOutcome.FAILED) {
+                    latest.failedItems.filterNot { it.modId == item.modId } + FailedScanItem(
+                        modId = item.modId,
+                        name = item.name.ifBlank { "Mod #${item.modId}" },
+                        url = item.url,
+                        reason = item.reason,
+                        listedUpdatedAt = item.listedUpdatedAt,
+                        listedVersion = item.listedVersion,
+                        lastError = result.detail,
+                        attempts = item.retryCount + 1
+                    )
+                } else {
+                    latest.failedItems.filterNot { it.modId == item.modId }
+                },
                 excludedCount = latest.excludedCount + if (excluded) 1 else 0,
                 statusMessage = when {
                     stored -> "Gespeichert: ${item.name.ifBlank { "Mod #${item.modId}" }}"
@@ -531,6 +550,7 @@ class ScanForegroundService : Service() {
                 "${state.retryAttemptCount} Wiederholungen • ${state.failedIds.size} Fehler"
         )
         scanStore.save(finalState)
+        historyStore.add(ScanRunSummary.completed(finalState))
         shuttingDownNormally = true
         stopForeground(STOP_FOREGROUND_REMOVE)
         notificationManager.notify(
@@ -598,16 +618,17 @@ class ScanForegroundService : Service() {
             .setContentTitle(title)
             .setContentText(text)
             .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(openAppPendingIntent())
+            .setContentIntent(openAppPendingIntent(REPORT_SCREEN_INDEX))
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_STATUS)
             .setPriority(Notification.PRIORITY_HIGH)
             .build()
 
-    private fun openAppPendingIntent(): PendingIntent = PendingIntent.getActivity(
+    private fun openAppPendingIntent(screen: Int = SCANNER_SCREEN_INDEX): PendingIntent = PendingIntent.getActivity(
         this,
-        0,
+        screen,
         Intent(this, MainActivity::class.java).apply {
+            putExtra(MainActivity.EXTRA_OPEN_SCREEN, screen)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or
                 Intent.FLAG_ACTIVITY_CLEAR_TOP or
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -698,6 +719,8 @@ class ScanForegroundService : Service() {
         private const val COMPLETE_CHANNEL_ID = "scanner_complete_v1"
         private const val ONGOING_NOTIFICATION_ID = 1101
         private const val COMPLETE_NOTIFICATION_ID = 1102
+        private const val SCANNER_SCREEN_INDEX = 0
+        private const val REPORT_SCREEN_INDEX = 2
 
         @Volatile
         var isActive: Boolean = false

@@ -40,19 +40,34 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      - name: Test and build debug APK
-        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug
+      - name: Test and build APKs
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest assembleDebug assembleRelease
 
-      - name: Verify APK exists
-        run: test -f app/build/outputs/apk/debug/app-debug.apk
+      - name: Verify APKs exist
+        run: |
+          test -f app/build/outputs/apk/debug/app-debug.apk
+          test -f app/build/outputs/apk/release/app-release-unsigned.apk
 
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk NexusSkyrimRadar-v0.13-debug.apk
+      - name: Prepare installable debug and aligned release APK
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk NexusSkyrimRadar-v0.14-debug.apk
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -p -f 4 \
+            app/build/outputs/apk/release/app-release-unsigned.apk \
+            NexusSkyrimRadar-v0.14-aligned-unsigned.apk
 
-      - name: Upload APK
+      - name: Include local release signing tool
+        run: |
+          mkdir -p signing-tools/lib
+          cp "$ANDROID_HOME/build-tools/36.0.0/apksigner" signing-tools/
+          cp "$ANDROID_HOME/build-tools/36.0.0/lib/apksigner.jar" signing-tools/lib/
+
+      - name: Upload APK build files
         uses: actions/upload-artifact@v4
         with:
-          name: NexusSkyrimRadar-v0.13-debug-apk
-          path: NexusSkyrimRadar-v0.13-debug.apk
+          name: NexusSkyrimRadar-v0.14-apk-build
+          path: |
+            NexusSkyrimRadar-v0.14-debug.apk
+            NexusSkyrimRadar-v0.14-aligned-unsigned.apk
+            signing-tools/
           if-no-files-found: error
           retention-days: 30

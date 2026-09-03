@@ -42,6 +42,7 @@ import com.meister.nexusradar.settings.*
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import java.time.Instant
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
@@ -58,16 +59,20 @@ private val RadarColors = darkColorScheme(
 class MainActivity : ComponentActivity() {
     private lateinit var repo: Repository
     private lateinit var scanStore: ScanStateStore
+    private lateinit var historyStore: ScanHistoryStore
     private lateinit var settingsStore: ScanSettingsStore
     private lateinit var exportStore: ExportDestinationStore
+    private val requestedScreen = mutableIntStateOf(0)
     private val json = Json { ignoreUnknownKeys = true }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         repo = Repository(AppDatabase.get(this).modDao())
         scanStore = ScanStateStore(this)
+        historyStore = ScanHistoryStore(this)
         settingsStore = ScanSettingsStore(this)
         exportStore = ExportDestinationStore(this)
+        requestedScreen.intValue = intent.getIntExtra(EXTRA_OPEN_SCREEN, 0).coerceIn(0, 4)
         val interruptedState = scanStore.load()
         val staleScan = (interruptedState.running || interruptedState.collecting) &&
             !ScanForegroundService.isActive
@@ -87,10 +92,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        requestedScreen.intValue = intent.getIntExtra(EXTRA_OPEN_SCREEN, 0).coerceIn(0, 4)
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     private fun RadarApp() {
-        var screen by rememberSaveable { mutableIntStateOf(0) }
+        var screen by rememberSaveable { mutableIntStateOf(requestedScreen.intValue) }
         var scanStatus by remember { mutableStateOf("Bereit") }
         var exportStatus by remember { mutableStateOf("Noch kein Export ausgeführt") }
         var address by remember {
@@ -98,12 +109,18 @@ class MainActivity : ComponentActivity() {
         }
         val scanStateFlow = remember { scanStore.observe() }
         val scanState by scanStateFlow.collectAsState(initial = scanStore.load())
+        val scanHistoryFlow = remember { historyStore.observe() }
+        val scanHistory by scanHistoryFlow.collectAsState(initial = historyStore.load())
         var settings by remember { mutableStateOf(settingsStore.load()) }
         var exportUri by remember { mutableStateOf(exportStore.load()) }
         var catalogFilters by remember { mutableStateOf(CatalogFilterState()) }
         val mods by repo.observeMods().collectAsState(initial = emptyList())
         val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
         val scope = rememberCoroutineScope()
+
+        LaunchedEffect(requestedScreen.intValue) {
+            screen = requestedScreen.intValue
+        }
 
         val notificationPermissionLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
@@ -192,10 +209,10 @@ class MainActivity : ComponentActivity() {
                         title = {
                             Column {
                                 Text(
-                                    listOf("Scanner", "Katalog", "Setup", "Export")[screen],
+                                    listOf("Scanner", "Katalog", "Berichte", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.13", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.14", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -239,7 +256,37 @@ class MainActivity : ComponentActivity() {
                             updateFilters = { catalogFilters = it },
                             openFilters = { scope.launch { drawerState.open() } }
                         )
-                        2 -> SettingsPane(settings) {
+                        2 -> ReportsPane(
+                            history = scanHistory,
+                            busy = scanState.running || scanState.collecting,
+                            retryFailed = { failedItems ->
+                                val queue = QueueOrdering.newestFirst(
+                                    failedItems.distinctBy { it.modId }.map { it.toQueueItem() }
+                                )
+                                if (queue.isNotEmpty() && !scanState.running && !scanState.collecting) {
+                                    requestScanNotifications()
+                                    scanStore.save(
+                                        PersistedScanState(
+                                            queue = queue,
+                                            delayMs = settings.delayMs,
+                                            startedWith = queue.size,
+                                            startedAt = Instant.now().toString(),
+                                            queuedNewCount = queue.count { it.reason == "NEW" },
+                                            queuedUpdateCount = queue.count { it.reason == "UPDATED" },
+                                            statusMessage = "Fehlerprüfung vorbereitet • ${queue.size} Mods"
+                                        )
+                                    )
+                                    runCatching { ScanForegroundService.resume(this@MainActivity) }
+                                        .onSuccess {
+                                            scanStatus = "Fehlgeschlagene Mods werden erneut geprüft"
+                                        }
+                                        .onFailure { error ->
+                                            scanStatus = "Neustart fehlgeschlagen: ${error.message ?: "Android hat den Dienst blockiert"}"
+                                        }
+                                }
+                            }
+                        )
+                        3 -> SettingsPane(settings) {
                             settings = it.normalized()
                             settingsStore.save(settings)
                         }
@@ -288,7 +335,7 @@ class MainActivity : ComponentActivity() {
         updateFilters: (CatalogFilterState) -> Unit,
         resetFilters: () -> Unit
     ) {
-        val screens = listOf("Scanner", "Katalog", "Setup", "Export")
+        val screens = listOf("Scanner", "Katalog", "Berichte", "Setup", "Export")
         val categoryCounts = remember(mods) {
             mods.groupingBy {
                 it.category?.takeIf(String::isNotBlank) ?: UNKNOWN_CATEGORY
@@ -308,7 +355,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.13 • lokaler Mod-Katalog",
+                    "v0.14 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -1056,6 +1103,199 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Composable
+    private fun ReportsPane(
+        history: List<ScanRunSummary>,
+        busy: Boolean,
+        retryFailed: (List<FailedScanItem>) -> Unit
+    ) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            item {
+                Text(
+                    "Scanberichte",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    "Ergebnisse und konkrete Fehler der letzten 20 abgeschlossenen Läufe",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (history.isEmpty()) {
+                item {
+                    SectionCard("Noch kein Bericht") {
+                        Text("Nach dem nächsten Komplettscan erscheint hier eine Zusammenfassung.")
+                        Text(
+                            "Die Fertigmeldung öffnet anschließend direkt diese Seite.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            } else {
+                items(history, key = { "report:${it.id}" }) { report ->
+                    ScanReportCard(
+                        report = report,
+                        initiallyExpanded = report.id == history.first().id,
+                        busy = busy,
+                        retryFailed = retryFailed
+                    )
+                }
+            }
+        }
+    }
+
+    @OptIn(ExperimentalLayoutApi::class)
+    @Composable
+    private fun ScanReportCard(
+        report: ScanRunSummary,
+        initiallyExpanded: Boolean,
+        busy: Boolean,
+        retryFailed: (List<FailedScanItem>) -> Unit
+    ) {
+        var expanded by rememberSaveable(report.id) { mutableStateOf(initiallyExpanded) }
+        val successful = (report.processedCount - report.failedCount - report.excludedCount)
+            .coerceAtLeast(0)
+
+        ElevatedCard(Modifier.fillMaxWidth()) {
+            Column(
+                Modifier.fillMaxWidth().padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(9.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                        Text(
+                            displayDateTime(report.completedAt),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            "${formatDuration(report.durationSeconds)} • ${report.processedCount} abgearbeitet",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Text(
+                        if (report.failedCount == 0) "ERFOLGREICH" else "${report.failedCount} FEHLER",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (report.failedCount == 0) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        }
+                    )
+                }
+
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    StatBadge("Entdeckt", report.discoveredCount)
+                    StatBadge("Neu", report.queuedNewCount)
+                    StatBadge("Updates", report.queuedUpdateCount)
+                    StatBadge("Ohne Fehler", successful)
+                }
+
+                if (expanded) {
+                    HorizontalDivider()
+                    Text(
+                        "Gestartet: ${displayDateTime(report.startedAt)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        MetaBadge("Unverändert ${report.skippedUnchangedCount}")
+                        MetaBadge("Wiederholungen ${report.retryAttemptCount}")
+                        MetaBadge("Ausgeschlossen ${report.excludedCount}")
+                    }
+
+                    if (report.failedItems.isEmpty()) {
+                        Text(
+                            "Keine fehlgeschlagenen Mods in diesem Lauf.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        Text(
+                            "Fehlerdetails",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.error,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        report.failedItems.take(MAX_VISIBLE_REPORT_ERRORS).forEach { failed ->
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+                            ) {
+                                Column(
+                                    Modifier.fillMaxWidth().padding(11.dp),
+                                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Text(
+                                        failed.name,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        "#${failed.modId} • ${failed.attempts} Versuche • ${failed.reason}",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                    Text(
+                                        failed.lastError.ifBlank { "Unbekannter Scanfehler" },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        maxLines = 4,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                        if (report.failedCount > MAX_VISIBLE_REPORT_ERRORS) {
+                            Text(
+                                "+ ${report.failedCount - MAX_VISIBLE_REPORT_ERRORS} weitere Fehler",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Button(
+                            onClick = { retryFailed(report.failedItems) },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !busy
+                        ) {
+                            Text(
+                                if (busy) "Scanner ist beschäftigt"
+                                else "${report.failedCount} fehlgeschlagene Mods erneut prüfen"
+                            )
+                        }
+                    }
+                    Text(
+                        "Tippen zum Einklappen",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Text(
+                        "Tippen für Details",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+
     @OptIn(ExperimentalLayoutApi::class)
     @Composable
     private fun SettingsPane(current: ScanSettings, update: (ScanSettings) -> Unit) {
@@ -1331,6 +1571,28 @@ class MainActivity : ComponentActivity() {
     private fun displayDate(value: String?): String =
         value?.substringBefore('T')?.takeIf(String::isNotBlank) ?: "unbekannt"
 
+    private fun displayDateTime(value: String?): String {
+        if (value.isNullOrBlank()) return "unbekannt"
+        return runCatching {
+            DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")
+                .format(Instant.parse(value).atZone(ZoneId.systemDefault()))
+        }.getOrElse {
+            value.replace('T', ' ').take(16)
+        }
+    }
+
+    private fun formatDuration(seconds: Long?): String {
+        if (seconds == null) return "Dauer unbekannt"
+        val hours = seconds / 3600
+        val minutes = (seconds % 3600) / 60
+        val remainingSeconds = seconds % 60
+        return when {
+            hours > 0 -> "${hours} Std. ${minutes} Min."
+            minutes > 0 -> "${minutes} Min. ${remainingSeconds} Sek."
+            else -> "${remainingSeconds} Sek."
+        }
+    }
+
     private fun formatBytes(value: Long?): String {
         if (value == null) return "Größe unbekannt"
         val kib = 1024.0
@@ -1349,6 +1611,11 @@ class MainActivity : ComponentActivity() {
         value >= 1_000_000 -> String.format(java.util.Locale.GERMAN, "%.1f Mio.", value / 1_000_000.0)
         value >= 1_000 -> String.format(java.util.Locale.GERMAN, "%.1f Tsd.", value / 1_000.0)
         else -> value.toString()
+    }
+
+    companion object {
+        const val EXTRA_OPEN_SCREEN = "open_screen"
+        private const val MAX_VISIBLE_REPORT_ERRORS = 10
     }
 
 }

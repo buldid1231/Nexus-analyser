@@ -22,6 +22,27 @@ data class QueueItem(
     val retryCount: Int = 0
 )
 
+@Serializable
+data class FailedScanItem(
+    val modId: Long,
+    val name: String,
+    val url: String,
+    val reason: String,
+    val lastError: String,
+    val attempts: Int,
+    val listedUpdatedAt: String? = null,
+    val listedVersion: String? = null
+) {
+    fun toQueueItem(): QueueItem = QueueItem(
+        modId = modId,
+        url = url,
+        name = name,
+        listedUpdatedAt = listedUpdatedAt,
+        listedVersion = listedVersion,
+        reason = reason
+    )
+}
+
 @Serializable data class PersistedScanState(
     val queue: List<QueueItem> = emptyList(),
     val processedIds: Set<Long> = emptySet(),
@@ -46,6 +67,7 @@ data class QueueItem(
     val retryAttemptCount: Int = 0,
     val excludedCount: Int = 0,
     val failedMessages: Map<Long, String> = emptyMap(),
+    val failedItems: List<FailedScanItem> = emptyList(),
     val statusMessage: String = ""
 ) {
     val processedCount: Int get() = processedIds.size

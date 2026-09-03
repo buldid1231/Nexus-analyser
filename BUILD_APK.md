@@ -15,8 +15,8 @@ Dieses Projekt enthält `.github/workflows/android-apk.yml`.
 4. Workflow **Build Android APK** auswählen.
 5. **Run workflow** drücken und `main` auswählen.
 6. Nach erfolgreichem Lauf den Workflow öffnen.
-7. Unter **Artifacts** `NexusSkyrimRadar-v0.13-debug-apk` herunterladen.
-8. ZIP entpacken und `NexusSkyrimRadar-v0.13-debug.apk` auf Android installieren.
+7. Unter **Artifacts** `NexusSkyrimRadar-v0.14-apk-build` herunterladen.
+8. ZIP entpacken. `NexusSkyrimRadar-v0.14-debug.apk` kann direkt für einen kurzlebigen Test installiert werden.
 
 ## Automatisch
 
@@ -24,4 +24,4 @@ Jeder Push auf `main` baut ebenfalls eine neue Debug-APK.
 
 ## Android-Hinweis
 
-Die APK ist eine Debug-APK und wird von GitHub Actions mit dem Debug-Key signiert. Für private Tests reicht das. Für eine spätere veröffentlichbare Release-APK sollte ein eigener Signing-Key verwendet werden.
+Die Debug-APK wird von GitHub Actions mit einem temporären Debug-Key signiert. Der Key kann sich zwischen Builds ändern. Für zuverlässige Updates muss `NexusSkyrimRadar-v0.14-aligned-unsigned.apk` lokal immer mit demselben privaten Release-Key signiert werden. Einen privaten Key niemals in ein öffentliches Repository hochladen.
