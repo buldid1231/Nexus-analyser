@@ -17,7 +17,9 @@ data class QueueItem(
     val name: String = "",
     val listedUpdatedAt: String? = null,
     val listedVersion: String? = null,
-    val reason: String = "NEW"
+    val reason: String = "NEW",
+    /** Number of failed attempts already made for this queue item. */
+    val retryCount: Int = 0
 )
 
 @Serializable data class PersistedScanState(
@@ -35,6 +37,15 @@ data class QueueItem(
     val queuedUpdateCount: Int = 0,
     val skippedUnchangedCount: Int = 0,
     val listingBatches: Int = 0,
+    /** True while a full run still has listing pages left to collect. */
+    val collectionPending: Boolean = false,
+    /** Listing URL that can be reopened after a pause or process restart. */
+    val currentListingUrl: String? = null,
+    /** Prevents duplicate counters and queue entries when collection is resumed. */
+    val listingSeenIds: Set<Long> = emptySet(),
+    val retryAttemptCount: Int = 0,
+    val excludedCount: Int = 0,
+    val failedMessages: Map<Long, String> = emptyMap(),
     val statusMessage: String = ""
 ) {
     val processedCount: Int get() = processedIds.size

@@ -13,6 +13,19 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlin.coroutines.resume
 
+enum class ScanAttemptOutcome {
+    STORED,
+    EXCLUDED,
+    FAILED
+}
+
+data class ScanAttemptResult(
+    val outcome: ScanAttemptOutcome,
+    val detail: String
+) {
+    val successful: Boolean get() = outcome != ScanAttemptOutcome.FAILED
+}
+
 /**
  * Reads a Nexus mod page from a WebView and stores the parsed record.
  *
@@ -28,7 +41,7 @@ class NexusModScanner(
         settings: ScanSettings,
         setStatus: (String) -> Unit,
         expectedId: Long?
-    ): Boolean {
+    ): ScanAttemptResult {
         return try {
             var record = parseRecordWithRetry(web, expectedId)
                 ?: error("Nexus-Metadaten wurden nicht rechtzeitig geladen")
@@ -60,12 +73,20 @@ class NexusModScanner(
                 if (result.accepted == 1) "$state: ${record.name}$detail"
                 else "Ausgeschlossen: ${record.name}"
             )
-            result.accepted == 1
+            if (result.accepted == 1) {
+                ScanAttemptResult(ScanAttemptOutcome.STORED, record.name)
+            } else {
+                ScanAttemptResult(
+                    ScanAttemptOutcome.EXCLUDED,
+                    "Kein eigentlicher Mod oder ausgeschlossener Inhalt"
+                )
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            setStatus("Parserfehler: ${error.message ?: "unbekannt"}")
-            false
+            val detail = error.message?.take(180) ?: "unbekannter Parserfehler"
+            setStatus("Parserfehler: $detail")
+            ScanAttemptResult(ScanAttemptOutcome.FAILED, detail)
         }
     }
 

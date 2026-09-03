@@ -34,20 +34,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
-import com.meister.nexusradar.browser.NexusPageParser
 import com.meister.nexusradar.data.AppDatabase
 import com.meister.nexusradar.data.ModEntity
 import com.meister.nexusradar.domain.*
 import com.meister.nexusradar.scan.*
 import com.meister.nexusradar.settings.*
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
-import kotlin.coroutines.resume
 
 private val RadarColors = darkColorScheme(
     primary = Color(0xFFFF8A3D),
@@ -73,17 +69,14 @@ class MainActivity : ComponentActivity() {
         settingsStore = ScanSettingsStore(this)
         exportStore = ExportDestinationStore(this)
         val interruptedState = scanStore.load()
-        val staleQueueRun = interruptedState.running && !ScanForegroundService.isActive
-        if (staleQueueRun || interruptedState.collecting) {
+        val staleScan = (interruptedState.running || interruptedState.collecting) &&
+            !ScanForegroundService.isActive
+        if (staleScan) {
             scanStore.save(
                 interruptedState.copy(
                     running = false,
                     collecting = false,
-                    statusMessage = if (staleQueueRun) {
-                        "Hintergrundscan unterbrochen • Queue kann fortgesetzt werden"
-                    } else {
-                        interruptedState.statusMessage
-                    }
+                    statusMessage = "Hintergrundscan unterbrochen • Fortschritt kann fortgesetzt werden"
                 )
             )
         }
@@ -202,7 +195,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.12", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.13", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -315,7 +308,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.12 • lokaler Mod-Katalog",
+                    "v0.13 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -516,6 +509,7 @@ class MainActivity : ComponentActivity() {
         var localWeb by remember { mutableStateOf<WebView?>(null) }
         var confirmReset by remember { mutableStateOf(false) }
         val busy = scanState.running || scanState.collecting
+        val hasPausedWork = scanState.collectionPending || scanState.queue.isNotEmpty()
         val denominator = scanState.totalForRun.coerceAtLeast(1)
         val progress = (scanState.processedCount.toFloat() / denominator.toFloat())
             .coerceIn(0f, 1f)
@@ -563,57 +557,42 @@ class MainActivity : ComponentActivity() {
                 ) { Text("Öffnen") }
             }
 
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = {
-                        localWeb?.let {
-                            collectListingPages(
-                                it, scanState, setScanState, settings, setStatus
-                            )
+            Button(
+                onClick = {
+                    requestScanNotifications()
+                    CookieManager.getInstance().flush()
+                    runCatching {
+                        if (hasPausedWork) {
+                            ScanForegroundService.resume(this@MainActivity)
+                        } else {
+                            if (isModDetailsPage(address)) {
+                                error("Bitte die Skyrim-Modliste statt einer einzelnen Modseite öffnen")
+                            }
+                            ScanForegroundService.startFull(this@MainActivity, address)
                         }
-                    },
-                    modifier = Modifier.weight(1f),
-                    enabled = !busy
-                ) {
-                    Text(if (scanState.collecting) "Sammle …" else "Liste sammeln", maxLines = 1)
-                }
-                Button(
-                    onClick = {
-                        requestScanNotifications()
-                        CookieManager.getInstance().flush()
-                        val starting = scanState.copy(
-                            running = true,
-                            collecting = false,
-                            delayMs = settings.delayMs,
-                            startedWith = if (scanState.startedWith > 0) {
-                                scanState.startedWith
+                    }.onSuccess {
+                        setStatus(
+                            if (hasPausedWork) {
+                                "Scan wird fortgesetzt – du kannst wieder andere Apps öffnen"
                             } else {
-                                scanState.queue.size + scanState.processedIds.size
-                            },
-                            startedAt = scanState.startedAt ?: Instant.now().toString(),
-                            statusMessage = "Hintergrundscan wird gestartet …"
+                                "Komplettscan gestartet – Listensammlung und Modscan laufen im Hintergrund"
+                            }
                         )
-                        setScanState(starting)
-                        runCatching {
-                            ScanForegroundService.start(this@MainActivity)
-                        }.onSuccess {
-                            setStatus("Hintergrundscan gestartet – du kannst jetzt andere Apps öffnen")
-                        }.onFailure { error ->
-                            setScanState(
-                                starting.copy(
-                                    running = false,
-                                    statusMessage = "Hintergrundscan konnte nicht starten"
-                                )
-                            )
-                            setStatus("Startfehler: ${error.message ?: "Android hat den Dienst blockiert"}")
-                        }
+                    }.onFailure { error ->
+                        setStatus("Startfehler: ${error.message ?: "Android hat den Dienst blockiert"}")
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
+            ) {
+                Text(
+                    when {
+                        busy -> "Komplettscan läuft …"
+                        hasPausedWork -> "Scan fortsetzen"
+                        else -> "Komplettscan im Hintergrund starten"
                     },
-                    modifier = Modifier.weight(1f),
-                    enabled = scanState.queue.isNotEmpty() && !busy
-                ) { Text("Queue starten", maxLines = 1) }
+                    maxLines = 1
+                )
             }
 
             Row(
@@ -629,11 +608,7 @@ class MainActivity : ComponentActivity() {
                 ) { Text("Einzelmod", maxLines = 1) }
                 OutlinedButton(
                     onClick = {
-                        if (scanState.collecting) {
-                            val paused = scanState.copy(running = false, collecting = false)
-                            setScanState(paused)
-                            setStatus("Sammeln pausiert")
-                        } else if (scanState.running) {
+                        if (busy) {
                             runCatching { ScanForegroundService.pause(this@MainActivity) }
                                 .onSuccess { setStatus("Scan wird sicher pausiert …") }
                                 .onFailure { setStatus("Pausieren fehlgeschlagen: ${it.message}") }
@@ -660,6 +635,21 @@ class MainActivity : ComponentActivity() {
                         Text("Fertig ${scanState.processedIds.size}")
                         Text("Fehler ${scanState.failedIds.size}")
                     }
+                    if (scanState.retryAttemptCount > 0 || scanState.excludedCount > 0) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                "Wiederholungen ${scanState.retryAttemptCount}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                "Ausgeschlossen ${scanState.excludedCount}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -673,7 +663,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
-                        "Smart-Scan • ${scanState.listingBatches} Listen-Schritte • ${settings.rangeDays} Tage\n" +
+                        "Ein-Klick-Smart-Scan • ${scanState.listingBatches} Listen-Schritte • ${settings.rangeDays} Tage\n" +
                             scanState.statusMessage.ifBlank { status },
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -726,140 +716,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun collectListingPages(
-        web: WebView,
-        initial: PersistedScanState,
-        setState: (PersistedScanState) -> Unit,
-        settings: ScanSettings,
-        setStatus: (String) -> Unit
-    ) {
-        if (initial.running || initial.collecting) return
-        if (isModDetailsPage(web.url)) {
-            setStatus("Bitte zuerst die Skyrim-Modliste öffnen – keine einzelne Modseite")
-            return
-        }
-        lifecycleScope.launch {
-            val continuingQueue = initial.queue.isNotEmpty()
-            var state = if (continuingQueue) {
-                initial.copy(collecting = true, statusMessage = "")
-            } else {
-                initial.copy(
-                    processedIds = emptySet(),
-                    failedIds = emptySet(),
-                    running = false,
-                    collecting = true,
-                    startedWith = 0,
-                    startedAt = null,
-                    discoveredCount = 0,
-                    queuedNewCount = 0,
-                    queuedUpdateCount = 0,
-                    skippedUnchangedCount = 0,
-                    listingBatches = 0,
-                    statusMessage = ""
-                )
-            }
-            setState(state)
-
-            val seenListingIds = mutableSetOf<Long>()
-            val visitedUrls = mutableSetOf<String>()
-            var stepsThisCollection = 0
-            var stalledRounds = 0
-            var reachedLimit = false
-            try {
-                while (stepsThisCollection < settings.pageLimit) {
-                    if (!scanStore.load().collecting) break
-                    val parsed = readVisibleLinksWithRetry(web, seenListingIds)
-                    if (parsed == null) {
-                        setStatus("Nexus-Liste konnte nicht gelesen werden")
-                        break
-                    }
-
-                    parsed.url?.let { visitedUrls += it }
-                    val freshLinks = parsed.links.filter { seenListingIds.add(it.mod_id) }
-                    if (freshLinks.isNotEmpty()) {
-                        val plan = repo.planListingScan(freshLinks)
-                        val alreadyPlanned = (state.queue.map { it.modId } + state.processedIds).toSet()
-                        val added = plan.candidates.filter { it.link.mod_id !in alreadyPlanned }
-                        val queueItems = added.map { candidate ->
-                            QueueItem(
-                                modId = candidate.link.mod_id,
-                                url = candidate.link.url,
-                                name = candidate.link.name,
-                                listedUpdatedAt = candidate.link.updated_at,
-                                listedVersion = candidate.link.version,
-                                reason = candidate.reason.name
-                            )
-                        }
-                        state = state.copy(
-                            queue = state.queue + queueItems,
-                            lastUrl = parsed.url,
-                            discoveredCount = state.discoveredCount + freshLinks.size,
-                            queuedNewCount = state.queuedNewCount +
-                                added.count { it.reason == ListingScanReason.NEW },
-                            queuedUpdateCount = state.queuedUpdateCount +
-                                added.count { it.reason == ListingScanReason.UPDATED },
-                            skippedUnchangedCount = state.skippedUnchangedCount + plan.unchangedCount,
-                            listingBatches = state.listingBatches + 1
-                        )
-                        stepsThisCollection++
-                        setState(state)
-                        stalledRounds = 0
-                        setStatus(
-                            "Schritt $stepsThisCollection/${settings.pageLimit}: " +
-                                "+${added.count { it.reason == ListingScanReason.NEW }} neu, " +
-                                "+${added.count { it.reason == ListingScanReason.UPDATED }} Updates, " +
-                                "${plan.unchangedCount} unverändert"
-                        )
-                    } else {
-                        stalledRounds++
-                    }
-
-                    if (stepsThisCollection >= settings.pageLimit) {
-                        reachedLimit = true
-                        break
-                    }
-                    if (stalledRounds >= 3) break
-
-                    val directNext = parsed.next_url?.takeIf { next ->
-                        next != parsed.url && next !in visitedUrls
-                    }
-                    if (directNext != null) {
-                        visitedUrls += directNext
-                        web.loadUrl(directNext)
-                        delay(settings.delayMs.coerceAtLeast(1500L))
-                        continue
-                    }
-
-                    val advance = requestNextListingBatch(web)
-                    when (advance?.action) {
-                        "navigate" -> {
-                            val target = advance.next_url?.takeIf { it !in visitedUrls }
-                            if (target != null) {
-                                visitedUrls += target
-                                web.loadUrl(target)
-                            } else {
-                                stalledRounds++
-                            }
-                        }
-                        "clicked", "scrolled" -> Unit
-                        else -> stalledRounds++
-                    }
-                    delay(settings.delayMs.coerceAtLeast(1500L))
-                }
-            } finally {
-                val suffix = if (reachedLimit) " • eingestelltes Limit erreicht" else ""
-                val message =
-                    "Gesammelt: ${state.queue.size} offen • " +
-                        "${state.skippedUnchangedCount} unverändert übersprungen$suffix"
-                state = state.copy(collecting = false, statusMessage = message)
-                setState(state)
-                setStatus(
-                    message
-                )
-            }
-        }
-    }
-
     private suspend fun scanCurrentPage(
         web: WebView,
         settings: ScanSettings,
@@ -870,38 +726,7 @@ class MainActivity : ComponentActivity() {
         settings = settings,
         setStatus = setStatus,
         expectedId = expectedId
-    )
-    private suspend fun readVisibleLinksWithRetry(
-        web: WebView,
-        alreadySeen: Set<Long> = emptySet()
-    ): VisibleLinksResult? {
-        var best: VisibleLinksResult? = null
-        repeat(10) {
-            val result = runCatching {
-                val raw = evaluateJavascript(web, NexusPageParser.collectVisibleModLinks)
-                json.decodeFromString<VisibleLinksResult>(decodeJsString(raw))
-            }.getOrNull()
-            if (result != null) {
-                best = result
-                if (result.links.any { it.mod_id !in alreadySeen }) return result
-            }
-            delay(500)
-        }
-        return best
-    }
-
-    private suspend fun requestNextListingBatch(web: WebView): ListingAdvanceResult? =
-        runCatching {
-            val raw = evaluateJavascript(web, NexusPageParser.advanceListing)
-            json.decodeFromString<ListingAdvanceResult>(decodeJsString(raw))
-        }.getOrNull()
-
-    private suspend fun evaluateJavascript(web: WebView, script: String): String =
-        suspendCancellableCoroutine { continuation ->
-            web.evaluateJavascript(script) { result ->
-                if (continuation.isActive) continuation.resume(result)
-            }
-        }
+    ).successful
 
     private fun isModDetailsPage(url: String?): Boolean =
         Regex("/skyrimspecialedition/mods/\\d+", RegexOption.IGNORE_CASE)
@@ -1319,7 +1144,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
             SectionCard("Hintergrundscan") {
-                Text("✓ Läuft mit sichtbarer Fortschrittsmeldung weiter, während du andere Apps nutzt")
+                Text("✓ Sammelt Listen und scannt Mods vollständig im Hintergrund")
+                Text("✓ Neueste Nexus-Aktualisierungen werden zuerst verarbeitet")
                 Text("✓ Über die Benachrichtigung kann der Scan sicher pausiert werden")
                 Text("✓ Nach Abschluss erscheint eine gut sichtbare Fertigmeldung")
                 Text(
@@ -1330,6 +1156,7 @@ class MainActivity : ComponentActivity() {
             }
             SectionCard("Scan-Regeln") {
                 Text("✓ Bereits bekannte Mods nur bei erkanntem Update erneut scannen")
+                Text("✓ Temporäre Fehler werden automatisch zweimal wiederholt")
                 Text("✓ Queue und Fortschritt bleiben nach App-Neustart erhalten")
                 Text("✓ Adult-Mods bleiben erhalten")
                 Text("✓ Nexus-Kategorien werden übernommen")
@@ -1524,9 +1351,4 @@ class MainActivity : ComponentActivity() {
         else -> value.toString()
     }
 
-    private fun decodeJsString(raw: String): String = runCatching {
-        json.decodeFromString<String>(raw)
-    }.getOrElse {
-        raw.trim('"').replace("\\\"", "\"").replace("\\\\", "\\")
-    }
 }
