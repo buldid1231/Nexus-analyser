@@ -1,6 +1,11 @@
 package com.meister.nexusradar.scan
 
 import android.content.Context
+import android.content.SharedPreferences
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -29,7 +34,8 @@ data class QueueItem(
     val queuedNewCount: Int = 0,
     val queuedUpdateCount: Int = 0,
     val skippedUnchangedCount: Int = 0,
-    val listingBatches: Int = 0
+    val listingBatches: Int = 0,
+    val statusMessage: String = ""
 ) {
     val processedCount: Int get() = processedIds.size
     val totalForRun: Int get() = if (startedWith > 0) startedWith else queue.size + processedIds.size
@@ -46,6 +52,15 @@ class ScanStateStore(context: Context) {
     fun save(state: PersistedScanState) {
         prefs.edit().putString("state", json.encodeToString(state)).apply()
     }
+
+    fun observe(): Flow<PersistedScanState> = callbackFlow {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == "state") trySend(load())
+        }
+        trySend(load())
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
 
     fun clear() = prefs.edit().remove("state").apply()
 }

@@ -1,8 +1,11 @@
 package com.meister.nexusradar
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -70,8 +73,19 @@ class MainActivity : ComponentActivity() {
         settingsStore = ScanSettingsStore(this)
         exportStore = ExportDestinationStore(this)
         val interruptedState = scanStore.load()
-        if (interruptedState.running || interruptedState.collecting) {
-            scanStore.save(interruptedState.copy(running = false, collecting = false))
+        val staleQueueRun = interruptedState.running && !ScanForegroundService.isActive
+        if (staleQueueRun || interruptedState.collecting) {
+            scanStore.save(
+                interruptedState.copy(
+                    running = false,
+                    collecting = false,
+                    statusMessage = if (staleQueueRun) {
+                        "Hintergrundscan unterbrochen • Queue kann fortgesetzt werden"
+                    } else {
+                        interruptedState.statusMessage
+                    }
+                )
+            )
         }
         setContent {
             MaterialTheme(colorScheme = RadarColors) {
@@ -89,13 +103,31 @@ class MainActivity : ComponentActivity() {
         var address by remember {
             mutableStateOf("https://www.nexusmods.com/games/skyrimspecialedition/mods")
         }
-        var scanState by remember { mutableStateOf(scanStore.load()) }
+        val scanStateFlow = remember { scanStore.observe() }
+        val scanState by scanStateFlow.collectAsState(initial = scanStore.load())
         var settings by remember { mutableStateOf(settingsStore.load()) }
         var exportUri by remember { mutableStateOf(exportStore.load()) }
         var catalogFilters by remember { mutableStateOf(CatalogFilterState()) }
         val mods by repo.observeMods().collectAsState(initial = emptyList())
         val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
         val scope = rememberCoroutineScope()
+
+        val notificationPermissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            if (!granted) {
+                scanStatus = "Scan läuft weiter • Fertig-Popup ist ohne Benachrichtigungsrecht deaktiviert"
+            }
+        }
+
+        val requestScanNotifications = {
+            if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
 
         val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) {
@@ -170,7 +202,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.11", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.12", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -203,10 +235,10 @@ class MainActivity : ComponentActivity() {
                             setStatus = { scanStatus = it },
                             scanState = scanState,
                             setScanState = { state ->
-                                scanState = state
                                 scanStore.save(state)
                             },
-                            settings = settings
+                            settings = settings,
+                            requestScanNotifications = requestScanNotifications
                         )
                         1 -> CatalogPane(
                             mods = mods,
@@ -283,7 +315,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.11 • lokaler Mod-Katalog",
+                    "v0.12 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -478,7 +510,8 @@ class MainActivity : ComponentActivity() {
         setStatus: (String) -> Unit,
         scanState: PersistedScanState,
         setScanState: (PersistedScanState) -> Unit,
-        settings: ScanSettings
+        settings: ScanSettings,
+        requestScanNotifications: () -> Unit
     ) {
         var localWeb by remember { mutableStateOf<WebView?>(null) }
         var confirmReset by remember { mutableStateOf(false) }
@@ -549,8 +582,33 @@ class MainActivity : ComponentActivity() {
                 }
                 Button(
                     onClick = {
-                        localWeb?.let {
-                            runQueue(it, scanState, setScanState, settings, setStatus)
+                        requestScanNotifications()
+                        CookieManager.getInstance().flush()
+                        val starting = scanState.copy(
+                            running = true,
+                            collecting = false,
+                            delayMs = settings.delayMs,
+                            startedWith = if (scanState.startedWith > 0) {
+                                scanState.startedWith
+                            } else {
+                                scanState.queue.size + scanState.processedIds.size
+                            },
+                            startedAt = scanState.startedAt ?: Instant.now().toString(),
+                            statusMessage = "Hintergrundscan wird gestartet …"
+                        )
+                        setScanState(starting)
+                        runCatching {
+                            ScanForegroundService.start(this@MainActivity)
+                        }.onSuccess {
+                            setStatus("Hintergrundscan gestartet – du kannst jetzt andere Apps öffnen")
+                        }.onFailure { error ->
+                            setScanState(
+                                starting.copy(
+                                    running = false,
+                                    statusMessage = "Hintergrundscan konnte nicht starten"
+                                )
+                            )
+                            setStatus("Startfehler: ${error.message ?: "Android hat den Dienst blockiert"}")
                         }
                     },
                     modifier = Modifier.weight(1f),
@@ -571,10 +629,14 @@ class MainActivity : ComponentActivity() {
                 ) { Text("Einzelmod", maxLines = 1) }
                 OutlinedButton(
                     onClick = {
-                        if (busy) {
+                        if (scanState.collecting) {
                             val paused = scanState.copy(running = false, collecting = false)
                             setScanState(paused)
-                            setStatus(if (scanState.collecting) "Sammeln pausiert" else "Scan pausiert")
+                            setStatus("Sammeln pausiert")
+                        } else if (scanState.running) {
+                            runCatching { ScanForegroundService.pause(this@MainActivity) }
+                                .onSuccess { setStatus("Scan wird sicher pausiert …") }
+                                .onFailure { setStatus("Pausieren fehlgeschlagen: ${it.message}") }
                         } else {
                             confirmReset = true
                         }
@@ -611,7 +673,8 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
-                        "Smart-Scan • ${scanState.listingBatches} Listen-Schritte • ${settings.rangeDays} Tage\n$status",
+                        "Smart-Scan • ${scanState.listingBatches} Listen-Schritte • ${settings.rangeDays} Tage\n" +
+                            scanState.statusMessage.ifBlank { status },
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -678,7 +741,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             val continuingQueue = initial.queue.isNotEmpty()
             var state = if (continuingQueue) {
-                initial.copy(collecting = true)
+                initial.copy(collecting = true, statusMessage = "")
             } else {
                 initial.copy(
                     processedIds = emptySet(),
@@ -691,7 +754,8 @@ class MainActivity : ComponentActivity() {
                     queuedNewCount = 0,
                     queuedUpdateCount = 0,
                     skippedUnchangedCount = 0,
-                    listingBatches = 0
+                    listingBatches = 0,
+                    statusMessage = ""
                 )
             }
             setState(state)
@@ -783,91 +847,16 @@ class MainActivity : ComponentActivity() {
                     delay(settings.delayMs.coerceAtLeast(1500L))
                 }
             } finally {
-                state = state.copy(collecting = false)
-                setState(state)
                 val suffix = if (reachedLimit) " • eingestelltes Limit erreicht" else ""
-                setStatus(
+                val message =
                     "Gesammelt: ${state.queue.size} offen • " +
                         "${state.skippedUnchangedCount} unverändert übersprungen$suffix"
+                state = state.copy(collecting = false, statusMessage = message)
+                setState(state)
+                setStatus(
+                    message
                 )
             }
-        }
-    }
-
-    private fun runQueue(
-        web: WebView,
-        initial: PersistedScanState,
-        setState: (PersistedScanState) -> Unit,
-        settings: ScanSettings,
-        setStatus: (String) -> Unit
-    ) {
-        if (initial.running || initial.collecting || initial.queue.isEmpty()) return
-        var state = initial.copy(
-            running = true,
-            delayMs = settings.delayMs,
-            startedWith = initial.queue.size + initial.processedIds.size,
-            startedAt = initial.startedAt ?: Instant.now().toString()
-        )
-        setState(state)
-        lifecycleScope.launch {
-            while (state.running && state.queue.isNotEmpty()) {
-                if (!scanStore.load().running) {
-                    state = state.copy(running = false)
-                    setState(state)
-                    break
-                }
-                val item = state.queue.first()
-
-                val stillNeeded = repo.planListingScan(
-                    listOf(
-                        VisibleLink(
-                            mod_id = item.modId,
-                            url = item.url,
-                            name = item.name,
-                            updated_at = item.listedUpdatedAt,
-                            version = item.listedVersion
-                        )
-                    )
-                ).candidates.isNotEmpty()
-                if (!stillNeeded) {
-                    state = state.copy(
-                        queue = state.queue.drop(1),
-                        processedIds = state.processedIds + item.modId,
-                        skippedUnchangedCount = state.skippedUnchangedCount + 1
-                    )
-                    setState(state)
-                    setStatus("Übersprungen: #${item.modId} ist bereits aktuell")
-                    delay(150)
-                    continue
-                }
-
-                state = state.copy(queue = state.queue.drop(1), lastUrl = item.url)
-                setState(state)
-                val reasonLabel = if (item.reason == ListingScanReason.UPDATED.name) "Update" else "Neu"
-                setStatus("$reasonLabel • Lade #${item.modId}: ${item.name.ifBlank { "Mod" }}")
-                web.loadUrl(item.url)
-                delay(settings.delayMs.coerceAtLeast(1500L))
-
-                val ok = scanCurrentPage(
-                    web = web,
-                    settings = settings,
-                    setStatus = setStatus,
-                    expectedId = item.modId
-                )
-                state = if (ok) {
-                    state.copy(processedIds = state.processedIds + item.modId)
-                } else {
-                    state.copy(
-                        processedIds = state.processedIds + item.modId,
-                        failedIds = state.failedIds + item.modId
-                    )
-                }
-                setState(state)
-                delay(350)
-            }
-            state = state.copy(running = false)
-            setState(state)
-            setStatus(if (state.queue.isEmpty()) "Queue abgeschlossen" else "Queue pausiert")
         }
     }
 
@@ -876,110 +865,12 @@ class MainActivity : ComponentActivity() {
         settings: ScanSettings,
         setStatus: (String) -> Unit,
         expectedId: Long?
-    ): Boolean {
-        return try {
-            var record = parseRecordWithRetry(web, expectedId)
-                ?: error("Nexus-Metadaten wurden nicht rechtzeitig geladen")
-            if (settings.scanFileSizes && !record.url.isNullOrBlank()) {
-                setStatus("Lese Dateigröße: ${record.name}")
-                web.loadUrl(record.url + "?tab=files")
-                delay(settings.delayMs.coerceAtLeast(1500L))
-                val metrics = parseFileMetricsWithRetry(web)
-                if (metrics != null) {
-                    record = record.copy(
-                        file_size_bytes = metrics.file_size_bytes,
-                        main_files_count = metrics.main_files_count
-                    )
-                }
-            }
-            val (state, inRange) = RangeClassifier.classify(
-                record.published_at,
-                record.updated_at,
-                settings.rangeDays
-            )
-            val enriched = record.copy(
-                collection_state = state,
-                in_selected_range = inRange
-            )
-            val result = repo.importSingle(enriched)
-            val missing = record.diagnostics.size
-            val detail = if (missing == 0) "" else " • $missing Metadaten offen"
-            setStatus(
-                if (result.accepted == 1) "$state: ${record.name}$detail"
-                else "Ausgeschlossen: ${record.name}"
-            )
-            result.accepted == 1
-        } catch (error: Exception) {
-            setStatus("Parserfehler: ${error.message ?: "unbekannt"}")
-            false
-        }
-    }
-
-    private suspend fun parseRecordWithRetry(
-        web: WebView,
-        expectedId: Long?
-    ): NexusModRecord? {
-        var best: NexusModRecord? = null
-        var bestScore = -1
-        runCatching { evaluateJavascript(web, NexusPageParser.expandMetadataSections) }
-        delay(350)
-        repeat(10) { attempt ->
-            val candidate = runCatching {
-                val raw = evaluateJavascript(web, NexusPageParser.parseCurrentMod)
-                json.decodeFromString<NexusModRecord>(decodeJsString(raw))
-            }.getOrNull()
-            if (candidate != null && (expectedId == null || candidate.mod_id == expectedId)) {
-                val score = metadataScore(candidate)
-                if (score > bestScore) {
-                    best = candidate
-                    bestScore = score
-                }
-                if (
-                    candidate.mod_id > 0 &&
-                    candidate.name.isNotBlank() &&
-                    candidate.version != null &&
-                    candidate.category != null &&
-                    candidate.published_at != null &&
-                    candidate.updated_at != null &&
-                    attempt >= 2
-                ) {
-                    return candidate
-                }
-            }
-            delay(700)
-        }
-        return best
-    }
-
-    private fun metadataScore(record: NexusModRecord): Int =
-        listOf(
-            record.mod_id > 0,
-            record.name.isNotBlank(),
-            !record.version.isNullOrBlank(),
-            !record.category.isNullOrBlank(),
-            !record.published_at.isNullOrBlank(),
-            !record.updated_at.isNullOrBlank(),
-            !record.author.isNullOrBlank(),
-            record.endorsements != null,
-            record.total_downloads != null
-        ).count { it }
-
-    private suspend fun parseFileMetricsWithRetry(web: WebView): NexusFileMetrics? {
-        var best: NexusFileMetrics? = null
-        repeat(8) {
-            val candidate = runCatching {
-                val raw = evaluateJavascript(web, NexusPageParser.parseFilesTab)
-                json.decodeFromString<NexusFileMetrics>(decodeJsString(raw))
-            }.getOrNull()
-            if (candidate != null) {
-                best = candidate
-                if (candidate.file_size_bytes != null) return candidate
-            }
-            delay(500)
-        }
-        return best
-    }
-
+    ): Boolean = NexusModScanner(repo, json).scan(
+        web = web,
+        settings = settings,
+        setStatus = setStatus,
+        expectedId = expectedId
+    )
     private suspend fun readVisibleLinksWithRetry(
         web: WebView,
         alreadySeen: Set<Long> = emptySet()
@@ -1426,6 +1317,16 @@ class MainActivity : ComponentActivity() {
                         onCheckedChange = { update(current.copy(scanFileSizes = it)) }
                     )
                 }
+            }
+            SectionCard("Hintergrundscan") {
+                Text("✓ Läuft mit sichtbarer Fortschrittsmeldung weiter, während du andere Apps nutzt")
+                Text("✓ Über die Benachrichtigung kann der Scan sicher pausiert werden")
+                Text("✓ Nach Abschluss erscheint eine gut sichtbare Fertigmeldung")
+                Text(
+                    "Beim ersten Start bitte Benachrichtigungen erlauben. Ohne diese Berechtigung läuft der Scan trotzdem, Android zeigt aber kein Fertig-Popup.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             SectionCard("Scan-Regeln") {
                 Text("✓ Bereits bekannte Mods nur bei erkanntem Update erneut scannen")
