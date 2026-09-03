@@ -296,6 +296,19 @@ object TransferArchives {
         .digest(bytes)
         .joinToString("") { "%02x".format(it) }
 
+    fun sha256(input: InputStream): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        input.buffered().use { stream ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private const val MAX_ZIP_ENTRIES = 1_000
     private const val MAX_ENTRY_BYTES = 128 * 1024 * 1024
     private const val MAX_BACKUP_BYTES = MAX_ENTRY_BYTES

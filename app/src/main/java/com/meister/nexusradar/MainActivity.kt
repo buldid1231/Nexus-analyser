@@ -42,6 +42,10 @@ import com.meister.nexusradar.scan.*
 import com.meister.nexusradar.settings.*
 import com.meister.nexusradar.transfer.AppBackupPayload
 import com.meister.nexusradar.transfer.TransferArchives
+import com.meister.nexusradar.transfer.TransferFileRef
+import com.meister.nexusradar.transfer.TransferHistoryEntry
+import com.meister.nexusradar.transfer.TransferHistoryStore
+import com.meister.nexusradar.transfer.TransferKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,7 +72,8 @@ private data class ShareableDocument(
 )
 
 private data class StoredTransfer(
-    val document: ShareableDocument,
+    val documents: List<ShareableDocument>,
+    val history: TransferHistoryEntry,
     val message: String
 )
 
@@ -85,6 +90,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var settingsStore: ScanSettingsStore
     private lateinit var filterStore: CatalogFilterStore
     private lateinit var exportStore: ExportDestinationStore
+    private lateinit var transferHistoryStore: TransferHistoryStore
     private val requestedScreen = mutableIntStateOf(0)
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -96,6 +102,7 @@ class MainActivity : ComponentActivity() {
         settingsStore = ScanSettingsStore(this)
         filterStore = CatalogFilterStore(this)
         exportStore = ExportDestinationStore(this)
+        transferHistoryStore = TransferHistoryStore(this)
         requestedScreen.intValue = intent.getIntExtra(EXTRA_OPEN_SCREEN, 0).coerceIn(0, 4)
         val interruptedState = scanStore.load()
         val staleScan = (interruptedState.running || interruptedState.collecting) &&
@@ -129,7 +136,15 @@ class MainActivity : ComponentActivity() {
         var scanStatus by remember { mutableStateOf("Bereit") }
         var exportStatus by remember { mutableStateOf("Noch kein Export ausgeführt") }
         var transferBusy by remember { mutableStateOf(false) }
-        var lastShareable by remember { mutableStateOf<ShareableDocument?>(null) }
+        val initialTransferHistory = remember { transferHistoryStore.load() }
+        var transferHistory by remember { mutableStateOf(initialTransferHistory) }
+        var lastShareable by remember {
+            mutableStateOf<List<ShareableDocument>?>(
+                initialTransferHistory
+                    .firstOrNull { it.filesComplete && it.files.isNotEmpty() }
+                    ?.let(::shareableDocuments)
+            )
+        }
         var pendingBackupRestore by remember { mutableStateOf<Uri?>(null) }
         var address by remember {
             mutableStateOf("https://www.nexusmods.com/games/skyrimspecialedition/mods")
@@ -147,6 +162,12 @@ class MainActivity : ComponentActivity() {
         val updateCatalogFilters: (CatalogFilterState) -> Unit = { updated ->
             catalogFilters = updated
             filterStore.save(updated)
+        }
+        val rememberTransfer: (StoredTransfer) -> Unit = { result ->
+            transferHistoryStore.add(result.history)
+            transferHistory = transferHistoryStore.load()
+            lastShareable = result.documents.takeIf { it.isNotEmpty() }
+            exportStatus = result.message
         }
 
         LaunchedEffect(requestedScreen.intValue) {
@@ -298,7 +319,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Berichte", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.16", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.17", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -382,7 +403,11 @@ class MainActivity : ComponentActivity() {
                             settings = settings,
                             transferBusy = transferBusy,
                             scannerBusy = scanState.running || scanState.collecting,
-                            lastShareName = lastShareable?.name,
+                            lastShareName = lastShareable?.let { documents ->
+                                if (documents.size == 1) documents.single().name
+                                else "${documents.size} Dateien"
+                            },
+                            transferHistory = transferHistory,
                             updateSettings = {
                                 settings = it.normalized()
                                 settingsStore.save(settings)
@@ -396,7 +421,24 @@ class MainActivity : ComponentActivity() {
                                 backupImporter.launch(arrayOf("application/zip", "application/octet-stream"))
                             },
                             shareClick = {
-                                lastShareable?.let(::shareDocument)
+                                lastShareable?.let { documents ->
+                                    runCatching { shareDocuments(documents) }
+                                        .onFailure { error ->
+                                            exportStatus = "Teilen nicht möglich: ${error.message ?: "Datei nicht verfügbar"}"
+                                        }
+                                }
+                            },
+                            shareHistoryClick = { entry ->
+                                runCatching { shareDocuments(shareableDocuments(entry)) }
+                                    .onFailure { error ->
+                                        exportStatus = "Teilen nicht möglich: ${error.message ?: "Datei nicht verfügbar"}"
+                                    }
+                            },
+                            clearHistoryClick = {
+                                transferHistoryStore.clear()
+                                transferHistory = emptyList()
+                                lastShareable = null
+                                exportStatus = "Exportprotokoll gelöscht • Dateien bleiben erhalten"
                             },
                             zipExportClick = {
                                 val target = exportUri
@@ -409,8 +451,7 @@ class MainActivity : ComponentActivity() {
                                         try {
                                             runCatching { exportVerifiedZip(target, settings) }
                                                 .onSuccess { result ->
-                                                    lastShareable = result.document
-                                                    exportStatus = result.message
+                                                    rememberTransfer(result)
                                                 }
                                                 .onFailure { error ->
                                                     exportStatus = "ZIP-Exportfehler: ${error.message ?: "Schreibzugriff fehlgeschlagen"}"
@@ -431,7 +472,7 @@ class MainActivity : ComponentActivity() {
                                         exportStatus = "Einzelne JSON-Dateien werden geschrieben und geprüft …"
                                         try {
                                             runCatching { exportJsonFiles(target, settings) }
-                                                .onSuccess { exportStatus = it }
+                                                .onSuccess { result -> rememberTransfer(result) }
                                                 .onFailure { error ->
                                                     exportStatus = "JSON-Exportfehler: ${error.message ?: "Schreibzugriff fehlgeschlagen"}"
                                                 }
@@ -452,8 +493,7 @@ class MainActivity : ComponentActivity() {
                                         try {
                                             runCatching { createVerifiedBackup(target) }
                                                 .onSuccess { result ->
-                                                    lastShareable = result.document
-                                                    exportStatus = result.message
+                                                    rememberTransfer(result)
                                                 }
                                                 .onFailure { error ->
                                                     exportStatus = "Backupfehler: ${error.message ?: "Backup konnte nicht erstellt werden"}"
@@ -501,7 +541,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.16 • lokaler Mod-Katalog",
+                    "v0.17 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -1594,12 +1634,15 @@ class MainActivity : ComponentActivity() {
         transferBusy: Boolean,
         scannerBusy: Boolean,
         lastShareName: String?,
+        transferHistory: List<TransferHistoryEntry>,
         updateSettings: (ScanSettings) -> Unit,
         folderName: String,
         chooseFolder: () -> Unit,
         importClick: () -> Unit,
         restoreBackupClick: () -> Unit,
         shareClick: () -> Unit,
+        shareHistoryClick: (TransferHistoryEntry) -> Unit,
+        clearHistoryClick: () -> Unit,
         zipExportClick: () -> Unit,
         jsonExportClick: () -> Unit,
         createBackupClick: () -> Unit
@@ -1607,6 +1650,8 @@ class MainActivity : ComponentActivity() {
         var chunkText by remember(settings.chunkSize) {
             mutableStateOf(settings.chunkSize.toString())
         }
+        var showAllTransfers by rememberSaveable { mutableStateOf(false) }
+        var confirmClearHistory by rememberSaveable { mutableStateOf(false) }
         val exportableCount = when (settings.exportMode) {
             ExportMode.CHANGED -> mods.count {
                 it.inSelectedRange && it.collectionState in setOf("NEW", "UPDATED")
@@ -1711,7 +1756,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !transferBusy
                     ) {
-                        Text("Letzte ZIP-Datei teilen")
+                        Text("Letzten Export erneut teilen")
                     }
                     Text(
                         lastShareName,
@@ -1748,12 +1793,127 @@ class MainActivity : ComponentActivity() {
                     enabled = !locked
                 ) { Text("JSON-Chunk importieren") }
             }
+            SectionCard("7. Exportprotokoll") {
+                if (transferHistory.isEmpty()) {
+                    Text(
+                        "Noch keine geprüften Exporte oder Backups gespeichert.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    val visibleTransfers = if (showAllTransfers) transferHistory
+                    else transferHistory.take(5)
+                    visibleTransfers.forEach { entry ->
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant
+                        ) {
+                            Column(
+                                Modifier.fillMaxWidth().padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.Top
+                                ) {
+                                    Text(
+                                        entry.kind.label,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        displayDateTime(entry.createdAt),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Text(
+                                    "${entry.modCount} Mods • ${entry.fileCount} Datei(en) • ${entry.folderName}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                entry.exportMode?.let { mode ->
+                                    val modeLabel = runCatching { ExportMode.valueOf(mode).label }
+                                        .getOrDefault(mode)
+                                    Text(
+                                        modeLabel + (entry.rangeDays?.let { " • $it Tage" } ?: ""),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                val firstFile = entry.files.firstOrNull()
+                                if (firstFile != null) {
+                                    Text(
+                                        if (entry.fileCount == 1) firstFile.name
+                                        else "${firstFile.name} + ${entry.fileCount - 1} weitere",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        (if (entry.fileCount == 1) "SHA-256 " else "Erste Datei SHA-256 ") +
+                                            "${firstFile.sha256.take(20)}…",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = { shareHistoryClick(entry) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    enabled = entry.filesComplete && entry.files.isNotEmpty() && !transferBusy
+                                ) { Text("Erneut teilen") }
+                                if (!entry.filesComplete) {
+                                    Text(
+                                        "Sehr großer JSON-Export: Im Protokoll gespeichert, erneutes Sammelteilen deaktiviert.",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (transferHistory.size > 5) {
+                        TextButton(onClick = { showAllTransfers = !showAllTransfers }) {
+                            Text(
+                                if (showAllTransfers) "Nur die neuesten anzeigen"
+                                else "${transferHistory.size - 5} ältere Einträge anzeigen"
+                            )
+                        }
+                    }
+                    TextButton(
+                        onClick = { confirmClearHistory = true },
+                        enabled = !transferBusy
+                    ) { Text("Nur Protokoll löschen") }
+                    Text(
+                        "Das Löschen des Protokolls entfernt keine exportierten Dateien.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
             if (transferBusy) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Text(status, modifier = Modifier.padding(12.dp))
             }
+        }
+        if (confirmClearHistory) {
+            AlertDialog(
+                onDismissRequest = { confirmClearHistory = false },
+                title = { Text("Exportprotokoll löschen?") },
+                text = { Text("Nur die Protokolleinträge werden entfernt. Deine exportierten Dateien bleiben im gewählten Ordner erhalten.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmClearHistory = false
+                        clearHistoryClick()
+                    }) { Text("Protokoll löschen") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmClearHistory = false }) { Text("Abbrechen") }
+                }
+            )
         }
     }
 
@@ -1801,12 +1961,35 @@ class MainActivity : ComponentActivity() {
                     ?: error("ZIP-Datei konnte zur Prüfung nicht gelesen werden")
                 val verified = TransferArchives.verifyExport(input)
                 require(written == verified) { "Manifest stimmt nach dem Schreiben nicht überein" }
-                repo.markExported(exportedModIds(chunks))
                 val actualName = file.getName() ?: requestedName
+                val checksumInput = contentResolver.openInputStream(file.uri)
+                    ?: error("ZIP-Datei konnte nicht für die Prüfsumme gelesen werden")
+                val checksum = TransferArchives.sha256(checksumInput)
+                repo.markExported(exportedModIds(chunks))
+                val completedAt = Instant.now().toString()
+                val document = ShareableDocument(file.uri, actualName)
                 StoredTransfer(
-                    document = ShareableDocument(file.uri, actualName),
+                    documents = listOf(document),
+                    history = TransferHistoryEntry(
+                        id = "$completedAt:${TransferKind.VERIFIED_ZIP}:${file.uri}",
+                        createdAt = completedAt,
+                        kind = TransferKind.VERIFIED_ZIP,
+                        exportMode = settings.exportMode.name,
+                        rangeDays = settings.rangeDays,
+                        modCount = verified.total_mods,
+                        chunkCount = verified.chunk_count,
+                        folderName = directory.getName() ?: "Zielordner",
+                        files = listOf(
+                            TransferFileRef(
+                                uri = file.uri.toString(),
+                                name = actualName,
+                                mimeType = "application/zip",
+                                sha256 = checksum
+                            )
+                        )
+                    ),
                     message = "✓ ZIP geprüft: ${verified.total_mods} Mods • " +
-                        "${verified.chunk_count} Chunks • Exportstatus gespeichert • $actualName"
+                        "${verified.chunk_count} Chunks • Prüfsumme & Protokoll gespeichert • $actualName"
                 )
             } catch (error: Exception) {
                 file.delete()
@@ -1814,13 +1997,15 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-    private suspend fun exportJsonFiles(tree: Uri, settings: ScanSettings): String =
+    private suspend fun exportJsonFiles(tree: Uri, settings: ScanSettings): StoredTransfer =
         withContext(Dispatchers.IO) {
             val chunks = exportChunks(settings)
             val directory = writableDirectory(tree)
             val timestamp = transferTimestamp()
             val modeName = settings.exportMode.name.lowercase()
             val created = mutableListOf<DocumentFile>()
+            val documents = mutableListOf<ShareableDocument>()
+            val fileRefs = mutableListOf<TransferFileRef>()
             try {
                 chunks.forEachIndexed { index, contents ->
                     val name = "skyrimse_${modeName}_${settings.rangeDays}d_${timestamp}_chunk_" +
@@ -1839,10 +2024,40 @@ class MainActivity : ComponentActivity() {
                     require(parsed.chunk == index + 1 && parsed.schema_version == 8) {
                         "JSON-Prüfung fehlgeschlagen: $name"
                     }
+                    val actualName = file.getName() ?: name
+                    if (index < MAX_SHAREABLE_EXPORT_FILES) {
+                        documents += ShareableDocument(file.uri, actualName, "application/json")
+                        fileRefs += TransferFileRef(
+                            uri = file.uri.toString(),
+                            name = actualName,
+                            mimeType = "application/json",
+                            sha256 = TransferArchives.sha256(readBack.toByteArray(Charsets.UTF_8))
+                        )
+                    }
                 }
-                repo.markExported(exportedModIds(chunks))
-                "✓ ${created.size} JSON-Dateien geschrieben und zurückgelesen • " +
-                    "Exportstatus gespeichert • ${directory.getName() ?: "Zielordner"}"
+                val ids = exportedModIds(chunks)
+                repo.markExported(ids)
+                val completedAt = Instant.now().toString()
+                val allFilesRemembered = created.size <= MAX_SHAREABLE_EXPORT_FILES
+                val shareable = documents.takeIf { allFilesRemembered }.orEmpty()
+                StoredTransfer(
+                    documents = shareable,
+                    history = TransferHistoryEntry(
+                        id = "$completedAt:${TransferKind.JSON_CHUNKS}:${tree}",
+                        createdAt = completedAt,
+                        kind = TransferKind.JSON_CHUNKS,
+                        exportMode = settings.exportMode.name,
+                        rangeDays = settings.rangeDays,
+                        modCount = ids.size,
+                        chunkCount = chunks.size,
+                        folderName = directory.getName() ?: "Zielordner",
+                        files = fileRefs,
+                        fileCount = created.size,
+                        filesComplete = allFilesRemembered
+                    ),
+                    message = "✓ ${created.size} JSON-Dateien geschrieben und zurückgelesen • " +
+                        "Prüfsummen & Protokoll gespeichert • ${directory.getName() ?: "Zielordner"}"
+                )
             } catch (error: Exception) {
                 created.forEach { it.delete() }
                 throw error
@@ -1880,10 +2095,29 @@ class MainActivity : ComponentActivity() {
                     "Backup stimmt nach dem Schreiben nicht überein"
                 }
                 val actualName = file.getName() ?: requestedName
+                val checksumInput = contentResolver.openInputStream(file.uri)
+                    ?: error("Backupdatei konnte nicht für die Prüfsumme gelesen werden")
+                val checksum = TransferArchives.sha256(checksumInput)
+                val document = ShareableDocument(file.uri, actualName)
                 StoredTransfer(
-                    document = ShareableDocument(file.uri, actualName),
+                    documents = listOf(document),
+                    history = TransferHistoryEntry(
+                        id = "$createdAt:${TransferKind.FULL_BACKUP}:${file.uri}",
+                        createdAt = createdAt,
+                        kind = TransferKind.FULL_BACKUP,
+                        modCount = written.mod_count,
+                        folderName = directory.getName() ?: "Zielordner",
+                        files = listOf(
+                            TransferFileRef(
+                                uri = file.uri.toString(),
+                                name = actualName,
+                                mimeType = "application/zip",
+                                sha256 = checksum
+                            )
+                        )
+                    ),
                     message = "✓ Vollbackup geprüft: ${written.mod_count} Mods • " +
-                        "${written.report_count} Berichte • $actualName"
+                        "${written.report_count} Berichte • Prüfsumme & Protokoll gespeichert • $actualName"
                 )
             } catch (error: Exception) {
                 file.delete()
@@ -1948,14 +2182,38 @@ class MainActivity : ComponentActivity() {
         .withZone(ZoneOffset.UTC)
         .format(Instant.now())
 
-    private fun shareDocument(document: ShareableDocument) {
-        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-            type = document.mimeType
-            putExtra(Intent.EXTRA_STREAM, document.uri)
-            clipData = ClipData.newRawUri(document.name, document.uri)
+    private fun shareableDocuments(entry: TransferHistoryEntry): List<ShareableDocument> {
+        require(entry.filesComplete && entry.files.isNotEmpty()) {
+            "Dieser Protokolleintrag kann nicht gesammelt geteilt werden"
+        }
+        return entry.files.map { file ->
+            ShareableDocument(Uri.parse(file.uri), file.name, file.mimeType)
+        }
+    }
+
+    private fun shareDocuments(documents: List<ShareableDocument>) {
+        require(documents.isNotEmpty()) { "Keine Datei zum Teilen vorhanden" }
+        documents.forEach { document ->
+            contentResolver.openFileDescriptor(document.uri, "r")?.use { }
+                ?: error("${document.name} ist nicht mehr verfügbar")
+        }
+        val uris = ArrayList(documents.map { it.uri })
+        val clip = ClipData.newRawUri(documents.first().name, documents.first().uri).apply {
+            documents.drop(1).forEach { addItem(ClipData.Item(it.uri)) }
+        }
+        val sendIntent = Intent(
+            if (documents.size == 1) Intent.ACTION_SEND else Intent.ACTION_SEND_MULTIPLE
+        ).apply {
+            type = documents.map { it.mimeType }.distinct().singleOrNull()
+                ?: "application/octet-stream"
+            if (documents.size == 1) putExtra(Intent.EXTRA_STREAM, documents.single().uri)
+            else putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            clipData = clip
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        startActivity(Intent.createChooser(sendIntent, "${document.name} teilen"))
+        val title = if (documents.size == 1) "${documents.single().name} teilen"
+        else "${documents.size} Dateien teilen"
+        startActivity(Intent.createChooser(sendIntent, title))
     }
 
     private fun displayDate(value: String?): String =
@@ -2005,7 +2263,8 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_OPEN_SCREEN = "open_screen"
-        private const val APP_VERSION = "0.16.0"
+        private const val APP_VERSION = "0.17.0"
+        private const val MAX_SHAREABLE_EXPORT_FILES = 100
         private const val MAX_VISIBLE_REPORT_ERRORS = 10
     }
 

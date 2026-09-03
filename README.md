@@ -1,4 +1,4 @@
-# Nexus Skyrim Radar v0.16
+# Nexus Skyrim Radar v0.17
 
 Android-Prototyp zum Sammeln und Filtern von Nexus-Mod-Metadaten für Skyrim Special Edition / Anniversary Edition.
 
@@ -34,6 +34,9 @@ Android-Prototyp zum Sammeln und Filtern von Nexus-Mod-Metadaten für Skyrim Spe
 - geprüfter ZIP-Export mit Manifest, Dateigrößen und SHA-256-Prüfsummen
 - automatische Rückleseprüfung nach dem Schreiben in den Android-Zielordner
 - direktes Teilen des fertigen ZIP-Pakets über das Android-Teilen-Menü
+- dauerhaftes Exportprotokoll für ZIP, JSON-Chunks und Vollbackups
+- protokollierte Mod-/Dateizahlen, Zielordner, Dateinamen und SHA-256-Prüfsummen
+- bereits geprüfte Exporte lassen sich auch nach einem App-Neustart erneut teilen
 - einzelner JSON-Chunk-Export bleibt als kompatible Alternative erhalten
 - Vollbackup und Wiederherstellung für Katalog, Abhängigkeiten, Tags, Einstellungen, Filter, Queue und Scanberichte
 - Backups werden vor dem Ersetzen vorhandener Daten vollständig geprüft
