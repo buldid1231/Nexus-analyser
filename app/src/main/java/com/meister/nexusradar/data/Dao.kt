@@ -41,6 +41,9 @@ interface ModDao {
     @Query("SELECT COUNT(*) FROM mods WHERE inSelectedRange = 1 AND collectionState IN ('NEW','UPDATED')")
     suspend fun countChangedInRange(): Int
 
+    @Query("SELECT COUNT(*) FROM mods WHERE changedAt IS NOT NULL AND (lastExportedAt IS NULL OR changedAt > lastExportedAt)")
+    suspend fun countPendingExport(): Int
+
     @Query("SELECT * FROM mods ORDER BY modId LIMIT :limit OFFSET :offset")
     suspend fun chunk(limit: Int, offset: Int): List<ModEntity>
 
@@ -49,6 +52,12 @@ interface ModDao {
 
     @Query("SELECT * FROM mods WHERE inSelectedRange = 1 AND collectionState IN ('NEW','UPDATED') ORDER BY COALESCE(updatedAt, publishedAt, lastSeenAt) DESC LIMIT :limit OFFSET :offset")
     suspend fun changedRangeChunk(limit: Int, offset: Int): List<ModEntity>
+
+    @Query("SELECT * FROM mods WHERE changedAt IS NOT NULL AND (lastExportedAt IS NULL OR changedAt > lastExportedAt) ORDER BY changedAt DESC, modId LIMIT :limit OFFSET :offset")
+    suspend fun pendingExportChunk(limit: Int, offset: Int): List<ModEntity>
+
+    @Query("UPDATE mods SET lastExportedAt = :exportedAt WHERE modId IN (:ids)")
+    suspend fun markExported(ids: List<Long>, exportedAt: String)
 
     @Query("SELECT * FROM dependencies WHERE ownerModId IN (:ids)")
     suspend fun dependenciesFor(ids: List<Long>): List<DependencyEntity>

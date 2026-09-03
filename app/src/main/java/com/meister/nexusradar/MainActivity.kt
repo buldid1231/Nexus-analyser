@@ -298,7 +298,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Berichte", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.15", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.16", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -501,7 +501,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.15 • lokaler Mod-Katalog",
+                    "v0.16 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -557,6 +557,12 @@ class MainActivity : ComponentActivity() {
                     label = "Nur mit Requirements",
                     checked = filters.onlyWithRequirements,
                     onChecked = { updateFilters(filters.copy(onlyWithRequirements = it)) }
+                )
+                DrawerCheckbox(
+                    label = "Seit letztem Export geändert",
+                    detail = "${mods.count { it.hasPendingExport() }} noch nicht exportiert",
+                    checked = filters.onlyPendingExport,
+                    onChecked = { updateFilters(filters.copy(onlyPendingExport = it)) }
                 )
                 DrawerCheckbox(
                     label = "Nach Kategorie gruppieren",
@@ -952,6 +958,7 @@ class MainActivity : ComponentActivity() {
         val newCount = mods.count { it.collectionState == "NEW" && it.inSelectedRange }
         val updatedCount = mods.count { it.collectionState == "UPDATED" && it.inSelectedRange }
         val adultCount = mods.count { it.adult }
+        val pendingExportCount = mods.count { it.hasPendingExport() }
 
         Column(
             Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 10.dp),
@@ -989,6 +996,7 @@ class MainActivity : ComponentActivity() {
                 StatBadge("Gesamt", mods.size)
                 StatBadge("Neu", newCount)
                 StatBadge("Updates", updatedCount)
+                StatBadge("Export offen", pendingExportCount)
                 StatBadge("NSFW", adultCount)
                 StatBadge("Kategorien", mods.mapNotNull { it.category }.distinct().size)
             }
@@ -1180,6 +1188,11 @@ class MainActivity : ComponentActivity() {
                 ) {
                     MetaBadge("Update ${displayDate(mod.updatedAt)}")
                     MetaBadge(formatBytes(mod.fileSizeBytes))
+                    if (mod.hasPendingExport()) {
+                        MetaBadge("Export offen", alert = true)
+                    } else if (mod.lastExportedAt != null) {
+                        MetaBadge("Exportiert ${displayDate(mod.lastExportedAt)}")
+                    }
                     if (mod.adult) MetaBadge("NSFW", alert = true)
                     if (mod.hasSkseHint || mod.hasDllHint) MetaBadge("SKSE / DLL")
                 }
@@ -1200,6 +1213,20 @@ class MainActivity : ComponentActivity() {
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    if (!mod.previousVersion.isNullOrBlank() && mod.previousVersion != mod.version) {
+                        Text(
+                            "Version geändert: ${mod.previousVersion} → ${mod.version ?: "?"}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    if (!mod.previousUpdatedAt.isNullOrBlank() && mod.previousUpdatedAt != mod.updatedAt) {
+                        Text(
+                            "Update-Datum: ${displayDate(mod.previousUpdatedAt)} → ${displayDate(mod.updatedAt)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(5.dp)
@@ -1211,6 +1238,12 @@ class MainActivity : ComponentActivity() {
                         if (mod.requirementsCount > 0) MetaBadge("${mod.requirementsCount} Requirements")
                         if (mod.requiredByCount > 0) MetaBadge("Von ${formatCount(mod.requiredByCount.toLong())} Mods genutzt")
                     }
+                    Text(
+                        "Änderung erkannt: ${displayDateTime(mod.changedAt)} • " +
+                            "Letzter Export: ${displayDateTime(mod.lastExportedAt)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                     Text(
                         "Veröffentlicht: ${displayDate(mod.publishedAt)} • Tippen zum Schließen",
                         style = MaterialTheme.typography.labelSmall,
@@ -1578,6 +1611,7 @@ class MainActivity : ComponentActivity() {
             ExportMode.CHANGED -> mods.count {
                 it.inSelectedRange && it.collectionState in setOf("NEW", "UPDATED")
             }
+            ExportMode.SINCE_LAST_EXPORT -> mods.count { it.hasPendingExport() }
             ExportMode.RANGE -> mods.count { it.inSelectedRange }
             ExportMode.ALL -> mods.size
         }
@@ -1625,7 +1659,7 @@ class MainActivity : ComponentActivity() {
                 )
                 if (exportableCount == 0 && mods.isNotEmpty()) {
                     Text(
-                        "Wähle „Gesamter Katalog“ oder scanne die Mods nach dem Update erneut.",
+                        "Wähle „Gesamter Katalog“ oder einen anderen Exportumfang.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -1767,11 +1801,12 @@ class MainActivity : ComponentActivity() {
                     ?: error("ZIP-Datei konnte zur Prüfung nicht gelesen werden")
                 val verified = TransferArchives.verifyExport(input)
                 require(written == verified) { "Manifest stimmt nach dem Schreiben nicht überein" }
+                repo.markExported(exportedModIds(chunks))
                 val actualName = file.getName() ?: requestedName
                 StoredTransfer(
                     document = ShareableDocument(file.uri, actualName),
                     message = "✓ ZIP geprüft: ${verified.total_mods} Mods • " +
-                        "${verified.chunk_count} Chunks • $actualName"
+                        "${verified.chunk_count} Chunks • Exportstatus gespeichert • $actualName"
                 )
             } catch (error: Exception) {
                 file.delete()
@@ -1805,8 +1840,9 @@ class MainActivity : ComponentActivity() {
                         "JSON-Prüfung fehlgeschlagen: $name"
                     }
                 }
+                repo.markExported(exportedModIds(chunks))
                 "✓ ${created.size} JSON-Dateien geschrieben und zurückgelesen • " +
-                    (directory.getName() ?: "Zielordner")
+                    "Exportstatus gespeichert • ${directory.getName() ?: "Zielordner"}"
             } catch (error: Exception) {
                 created.forEach { it.delete() }
                 throw error
@@ -1883,8 +1919,7 @@ class MainActivity : ComponentActivity() {
     private suspend fun exportChunks(settings: ScanSettings): List<String> {
         val chunks = repo.exportChunks(
             chunkSize = settings.chunkSize,
-            onlyInRange = settings.exportMode != ExportMode.ALL,
-            onlyChanged = settings.exportMode == ExportMode.CHANGED,
+            mode = settings.exportMode,
             rangeDays = settings.rangeDays,
             scanStartedAt = scanStore.load().startedAt
         )
@@ -1893,6 +1928,11 @@ class MainActivity : ComponentActivity() {
         }
         return chunks
     }
+
+    private fun exportedModIds(chunks: List<String>): List<Long> = chunks
+        .flatMap { chunk -> json.decodeFromString<ImportChunk>(chunk).mods }
+        .map { it.mod_id }
+        .distinct()
 
     private fun writableDirectory(tree: Uri): DocumentFile {
         val directory = DocumentFile.fromTreeUri(this, tree)
@@ -1965,7 +2005,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_OPEN_SCREEN = "open_screen"
-        private const val APP_VERSION = "0.15.0"
+        private const val APP_VERSION = "0.16.0"
         private const val MAX_VISIBLE_REPORT_ERRORS = 10
     }
 

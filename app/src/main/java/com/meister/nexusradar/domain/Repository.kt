@@ -1,6 +1,7 @@
 package com.meister.nexusradar.domain
 
 import com.meister.nexusradar.data.*
+import com.meister.nexusradar.settings.ExportMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.json.Json
 import java.time.Duration
@@ -34,7 +35,14 @@ class Repository(private val dao: ModDao) {
         require(snapshot.tags.all { it.modId in knownIds }) {
             "Backup enthält Tags ohne zugehörigen Mod"
         }
-        dao.replaceCatalog(snapshot)
+        dao.replaceCatalog(
+            snapshot.copy(
+                mods = snapshot.mods.map { mod ->
+                    if (mod.changedAt == null) mod.copy(changedAt = mod.lastSeenAt)
+                    else mod
+                }
+            )
+        )
     }
 
     suspend fun planListingScan(links: List<VisibleLink>): ListingScanPlan {
@@ -68,6 +76,12 @@ class Repository(private val dao: ModDao) {
         val rejected = records.size - accepted.size
         val entities = accepted.map { r ->
             val previous = dao.byId(r.mod_id)
+            val trackedChange = ModChangeTracker.track(
+                previous = previous,
+                incomingVersion = r.version,
+                incomingUpdatedAt = r.updated_at,
+                now = now
+            )
             val cleanAuthor = r.author?.takeUnless {
                 it.equals("My mods", true) ||
                     it.equals("My profile", true) ||
@@ -110,7 +124,11 @@ class Repository(private val dao: ModDao) {
                 hasDllHint = ".dll" in signal || r.tags.any { it.equals("dll", true) } || previous?.hasDllHint == true,
                 collectionState = r.collection_state ?: previous?.collectionState ?: "DISCOVERED",
                 inSelectedRange = r.in_selected_range ?: previous?.inSelectedRange ?: true,
-                diagnostics = r.diagnostics.joinToString("|")
+                diagnostics = r.diagnostics.joinToString("|"),
+                previousVersion = trackedChange.previousVersion,
+                previousUpdatedAt = trackedChange.previousUpdatedAt,
+                changedAt = trackedChange.changedAt,
+                lastExportedAt = previous?.lastExportedAt
             )
         }
         dao.upsertMods(entities)
@@ -137,8 +155,7 @@ class Repository(private val dao: ModDao) {
 
     suspend fun exportChunks(
         chunkSize: Int = 100,
-        onlyInRange: Boolean = true,
-        onlyChanged: Boolean = true,
+        mode: ExportMode = ExportMode.CHANGED,
         rangeDays: Int = 14,
         scanStartedAt: String? = null
     ): List<String> {
@@ -146,18 +163,20 @@ class Repository(private val dao: ModDao) {
         val generatedAt = Instant.now()
         val rangeEnd = generatedAt.toString()
         val rangeStart = generatedAt.minus(Duration.ofDays(rangeDays.coerceIn(1, 2190).toLong())).toString()
-        val total = when {
-            onlyInRange && onlyChanged -> dao.countChangedInRange()
-            onlyInRange -> dao.countInRange()
-            else -> dao.count()
+        val total = when (mode) {
+            ExportMode.CHANGED -> dao.countChangedInRange()
+            ExportMode.SINCE_LAST_EXPORT -> dao.countPendingExport()
+            ExportMode.RANGE -> dao.countInRange()
+            ExportMode.ALL -> dao.count()
         }
         if (total == 0) return emptyList()
         val chunkCount = (total + size - 1) / size
         return (0 until chunkCount).map { index ->
-            val mods = when {
-                onlyInRange && onlyChanged -> dao.changedRangeChunk(size, index * size)
-                onlyInRange -> dao.rangeChunk(size, index * size)
-                else -> dao.chunk(size, index * size)
+            val mods = when (mode) {
+                ExportMode.CHANGED -> dao.changedRangeChunk(size, index * size)
+                ExportMode.SINCE_LAST_EXPORT -> dao.pendingExportChunk(size, index * size)
+                ExportMode.RANGE -> dao.rangeChunk(size, index * size)
+                ExportMode.ALL -> dao.chunk(size, index * size)
             }
             val ids = mods.map { it.modId }
             val deps = dao.dependenciesFor(ids).groupBy { it.ownerModId }
@@ -195,6 +214,12 @@ class Repository(private val dao: ModDao) {
                     mods = records
                 )
             )
+        }
+    }
+
+    suspend fun markExported(ids: List<Long>, exportedAt: String = Instant.now().toString()) {
+        ids.distinct().chunked(500).forEach { chunk ->
+            if (chunk.isNotEmpty()) dao.markExported(chunk, exportedAt)
         }
     }
 }

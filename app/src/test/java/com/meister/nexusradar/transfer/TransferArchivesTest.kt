@@ -30,7 +30,7 @@ class TransferArchivesTest {
         val written = TransferArchives.writeExport(
             output = output,
             chunks = chunks,
-            appVersion = "0.15.0",
+            appVersion = "0.16.0",
             exportMode = "ALL",
             rangeDays = 14
         )
@@ -50,7 +50,7 @@ class TransferArchivesTest {
                 chunk(1, NexusModRecord(mod_id = 11, name = "First")),
                 chunk(2, NexusModRecord(mod_id = 11, name = "Duplicate"))
             ),
-            appVersion = "0.15.0",
+            appVersion = "0.16.0",
             exportMode = "ALL",
             rangeDays = 14
         )
@@ -59,7 +59,7 @@ class TransferArchivesTest {
     @Test
     fun fullBackupRoundTripKeepsCatalogSettingsQueueAndReports() {
         val backup = AppBackupPayload(
-            app_version = "0.15.0",
+            app_version = "0.16.0",
             created_at = "2026-09-04T04:00:00Z",
             settings = ScanSettings(rangeDays = 30, pageLimit = 20),
             catalog_filters = CatalogFilterState(showAdult = true),
@@ -71,7 +71,10 @@ class TransferArchivesTest {
                         modId = 11,
                         name = "First",
                         firstSeenAt = "2026-09-03T00:00:00Z",
-                        lastSeenAt = "2026-09-04T00:00:00Z"
+                        lastSeenAt = "2026-09-04T00:00:00Z",
+                        previousVersion = "1.0",
+                        changedAt = "2026-09-04T00:00:00Z",
+                        lastExportedAt = "2026-09-04T01:00:00Z"
                     )
                 )
             )
@@ -85,12 +88,14 @@ class TransferArchivesTest {
         assertEquals(30, restored.settings.rangeDays)
         assertTrue(restored.catalog_filters.showAdult)
         assertEquals(11L, restored.catalog.mods.single().modId)
+        assertEquals("1.0", restored.catalog.mods.single().previousVersion)
+        assertEquals("2026-09-04T01:00:00Z", restored.catalog.mods.single().lastExportedAt)
     }
 
     @Test(expected = IllegalArgumentException::class)
     fun backupRejectsDependencyWithoutOwnerMod() {
         val backup = AppBackupPayload(
-            app_version = "0.15.0",
+            app_version = "0.16.0",
             created_at = "2026-09-04T04:00:00Z",
             settings = ScanSettings(),
             catalog_filters = CatalogFilterState(),

@@ -33,6 +33,7 @@ data class CatalogFilterState(
     val onlyInRange: Boolean = false,
     val onlySkseOrDll: Boolean = false,
     val onlyWithRequirements: Boolean = false,
+    val onlyPendingExport: Boolean = false,
     val sizeFilter: SizeFilter = SizeFilter.ALL,
     val sort: CatalogSort = CatalogSort.UPDATED_DESC,
     val groupByCategory: Boolean = true
@@ -75,6 +76,7 @@ fun applyCatalogFilters(
             (!filters.onlyInRange || mod.inSelectedRange) &&
             (!filters.onlySkseOrDll || mod.hasSkseHint || mod.hasDllHint) &&
             (!filters.onlyWithRequirements || mod.requirementsCount > 0) &&
+            (!filters.onlyPendingExport || mod.hasPendingExport()) &&
             sizeMatches &&
             (normalizedQuery.isEmpty() || normalizedQuery in haystack)
     }
@@ -121,6 +123,7 @@ fun CatalogFilterState.activeCount(): Int = listOf(
     onlyInRange,
     onlySkseOrDll,
     onlyWithRequirements,
+    onlyPendingExport,
     sizeFilter != SizeFilter.ALL,
     sort != CatalogSort.UPDATED_DESC,
     !groupByCategory

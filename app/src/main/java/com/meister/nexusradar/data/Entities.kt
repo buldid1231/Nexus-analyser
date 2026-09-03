@@ -29,7 +29,11 @@ data class ModEntity(
     val hasDllHint: Boolean = false,
     val collectionState: String = "DISCOVERED",
     val inSelectedRange: Boolean = true,
-    val diagnostics: String = ""
+    val diagnostics: String = "",
+    val previousVersion: String? = null,
+    val previousUpdatedAt: String? = null,
+    val changedAt: String? = null,
+    val lastExportedAt: String? = null
 )
 
 @Serializable

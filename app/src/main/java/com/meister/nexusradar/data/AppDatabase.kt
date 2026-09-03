@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [ModEntity::class, DependencyEntity::class, TagEntity::class], version = 6, exportSchema = false)
+@Database(entities = [ModEntity::class, DependencyEntity::class, TagEntity::class], version = 7, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun modDao(): ModDao
     companion object {
@@ -25,9 +25,19 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE mods ADD COLUMN previousVersion TEXT")
+                database.execSQL("ALTER TABLE mods ADD COLUMN previousUpdatedAt TEXT")
+                database.execSQL("ALTER TABLE mods ADD COLUMN changedAt TEXT")
+                database.execSQL("ALTER TABLE mods ADD COLUMN lastExportedAt TEXT")
+                database.execSQL("UPDATE mods SET changedAt = COALESCE(lastSeenAt, firstSeenAt)")
+            }
+        }
+
         fun get(context: Context): AppDatabase = INSTANCE ?: synchronized(this) {
             INSTANCE ?: Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, "nexus_skyrim_radar.db")
-                .addMigrations(MIGRATION_5_6)
+                .addMigrations(MIGRATION_5_6, MIGRATION_6_7)
                 .fallbackToDestructiveMigration()
                 .build().also { INSTANCE = it }
         }

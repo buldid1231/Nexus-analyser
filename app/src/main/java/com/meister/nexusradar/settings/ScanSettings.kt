@@ -15,12 +15,14 @@ import java.util.Locale
 @Serializable
 enum class ExportMode {
     CHANGED,
+    SINCE_LAST_EXPORT,
     RANGE,
     ALL;
 
     val label: String
         get() = when (this) {
             CHANGED -> "NEW + UPDATED"
+            SINCE_LAST_EXPORT -> "Seit letztem Export"
             RANGE -> "Gewählter Zeitraum"
             ALL -> "Gesamter Katalog"
         }
