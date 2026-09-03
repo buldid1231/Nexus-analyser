@@ -5,16 +5,31 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-@Serializable data class QueueItem(val modId: Long, val url: String, val name: String = "")
+@Serializable
+data class QueueItem(
+    val modId: Long,
+    val url: String,
+    val name: String = "",
+    val listedUpdatedAt: String? = null,
+    val listedVersion: String? = null,
+    val reason: String = "NEW"
+)
+
 @Serializable data class PersistedScanState(
     val queue: List<QueueItem> = emptyList(),
     val processedIds: Set<Long> = emptySet(),
     val running: Boolean = false,
+    val collecting: Boolean = false,
     val lastUrl: String? = null,
     val delayMs: Long = 3000L,
     val startedWith: Int = 0,
     val startedAt: String? = null,
-    val failedIds: Set<Long> = emptySet()
+    val failedIds: Set<Long> = emptySet(),
+    val discoveredCount: Int = 0,
+    val queuedNewCount: Int = 0,
+    val queuedUpdateCount: Int = 0,
+    val skippedUnchangedCount: Int = 0,
+    val listingBatches: Int = 0
 ) {
     val processedCount: Int get() = processedIds.size
     val totalForRun: Int get() = if (startedWith > 0) startedWith else queue.size + processedIds.size

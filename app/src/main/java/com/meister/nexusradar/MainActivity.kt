@@ -69,6 +69,10 @@ class MainActivity : ComponentActivity() {
         scanStore = ScanStateStore(this)
         settingsStore = ScanSettingsStore(this)
         exportStore = ExportDestinationStore(this)
+        val interruptedState = scanStore.load()
+        if (interruptedState.running || interruptedState.collecting) {
+            scanStore.save(interruptedState.copy(running = false, collecting = false))
+        }
         setContent {
             MaterialTheme(colorScheme = RadarColors) {
                 RadarApp()
@@ -83,7 +87,7 @@ class MainActivity : ComponentActivity() {
         var scanStatus by remember { mutableStateOf("Bereit") }
         var exportStatus by remember { mutableStateOf("Noch kein Export ausgeführt") }
         var address by remember {
-            mutableStateOf("https://www.nexusmods.com/skyrimspecialedition/mods/")
+            mutableStateOf("https://www.nexusmods.com/games/skyrimspecialedition/mods")
         }
         var scanState by remember { mutableStateOf(scanStore.load()) }
         var settings by remember { mutableStateOf(settingsStore.load()) }
@@ -166,7 +170,7 @@ class MainActivity : ComponentActivity() {
                                     listOf("Scanner", "Katalog", "Setup", "Export")[screen],
                                     maxLines = 1
                                 )
-                                Text("Nexus Skyrim Radar • v0.10", style = MaterialTheme.typography.labelSmall)
+                                Text("Nexus Skyrim Radar • v0.11", style = MaterialTheme.typography.labelSmall)
                             }
                         },
                         actions = {
@@ -279,7 +283,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(horizontal = 12.dp)
                 )
                 Text(
-                    "v0.10 • lokaler Mod-Katalog",
+                    "v0.11 • lokaler Mod-Katalog",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 12.dp, top = 2.dp, bottom = 12.dp)
@@ -478,6 +482,7 @@ class MainActivity : ComponentActivity() {
     ) {
         var localWeb by remember { mutableStateOf<WebView?>(null) }
         var confirmReset by remember { mutableStateOf(false) }
+        val busy = scanState.running || scanState.collecting
         val denominator = scanState.totalForRun.coerceAtLeast(1)
         val progress = (scanState.processedCount.toFloat() / denominator.toFloat())
             .coerceIn(0f, 1f)
@@ -485,17 +490,17 @@ class MainActivity : ComponentActivity() {
         if (confirmReset) {
             AlertDialog(
                 onDismissRequest = { confirmReset = false },
-                title = { Text("Scanstand zurücksetzen?") },
+                title = { Text("Queue zurücksetzen?") },
                 text = {
-                    Text("Queue, Fortschritt und Fehlerliste werden geleert. Der Katalog bleibt erhalten und kann danach mit den verbesserten Metadaten neu gescannt werden.")
+                    Text("Queue, Fortschritt und Zähler werden geleert. Der Katalog bleibt als Scan-Gedächtnis erhalten: Beim nächsten Sammeln werden bekannte Mods nur bei einem erkannten Update erneut eingeplant.")
                 },
                 confirmButton = {
                     TextButton(onClick = {
                         confirmReset = false
                         scanStore.clear()
                         setScanState(PersistedScanState())
-                        setStatus("Scanstand zurückgesetzt")
-                    }) { Text("Zurücksetzen") }
+                        setStatus("Queue zurückgesetzt – Scan-Gedächtnis bleibt erhalten")
+                    }) { Text("Queue leeren") }
                 },
                 dismissButton = {
                     TextButton(onClick = { confirmReset = false }) { Text("Abbrechen") }
@@ -538,8 +543,10 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     modifier = Modifier.weight(1f),
-                    enabled = !scanState.running
-                ) { Text("Liste sammeln", maxLines = 1) }
+                    enabled = !busy
+                ) {
+                    Text(if (scanState.collecting) "Sammle …" else "Liste sammeln", maxLines = 1)
+                }
                 Button(
                     onClick = {
                         localWeb?.let {
@@ -547,7 +554,7 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     modifier = Modifier.weight(1f),
-                    enabled = scanState.queue.isNotEmpty() && !scanState.running
+                    enabled = scanState.queue.isNotEmpty() && !busy
                 ) { Text("Queue starten", maxLines = 1) }
             }
 
@@ -560,21 +567,21 @@ class MainActivity : ComponentActivity() {
                         localWeb?.let { parseCurrentPage(it, settings, setStatus) }
                     },
                     modifier = Modifier.weight(1f),
-                    enabled = !scanState.running
+                    enabled = !busy
                 ) { Text("Einzelmod", maxLines = 1) }
                 OutlinedButton(
                     onClick = {
-                        if (scanState.running) {
-                            val paused = scanState.copy(running = false)
+                        if (busy) {
+                            val paused = scanState.copy(running = false, collecting = false)
                             setScanState(paused)
-                            setStatus("Scan pausiert")
+                            setStatus(if (scanState.collecting) "Sammeln pausiert" else "Scan pausiert")
                         } else {
                             confirmReset = true
                         }
                     },
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(if (scanState.running) "Pausieren" else "Neu scannen", maxLines = 1)
+                    Text(if (busy) "Pausieren" else "Queue leeren", maxLines = 1)
                 }
             }
 
@@ -591,12 +598,20 @@ class MainActivity : ComponentActivity() {
                         Text("Fertig ${scanState.processedIds.size}")
                         Text("Fehler ${scanState.failedIds.size}")
                     }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Neu ${scanState.queuedNewCount}", style = MaterialTheme.typography.bodySmall)
+                        Text("Updates ${scanState.queuedUpdateCount}", style = MaterialTheme.typography.bodySmall)
+                        Text("Übersprungen ${scanState.skippedUnchangedCount}", style = MaterialTheme.typography.bodySmall)
+                    }
                     LinearProgressIndicator(
                         progress = { progress },
                         modifier = Modifier.fillMaxWidth()
                     )
                     Text(
-                        "${settings.rangeDays} Tage • $status",
+                        "Smart-Scan • ${scanState.listingBatches} Listen-Schritte • ${settings.rangeDays} Tage\n$status",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -655,31 +670,127 @@ class MainActivity : ComponentActivity() {
         settings: ScanSettings,
         setStatus: (String) -> Unit
     ) {
+        if (initial.running || initial.collecting) return
+        if (isModDetailsPage(web.url)) {
+            setStatus("Bitte zuerst die Skyrim-Modliste öffnen – keine einzelne Modseite")
+            return
+        }
         lifecycleScope.launch {
-            var state = initial
-            var page = 0
-            var nextUrl: String? = web.url
-            while (page < settings.pageLimit && !nextUrl.isNullOrBlank()) {
-                if (page > 0) {
-                    web.loadUrl(nextUrl)
+            val continuingQueue = initial.queue.isNotEmpty()
+            var state = if (continuingQueue) {
+                initial.copy(collecting = true)
+            } else {
+                initial.copy(
+                    processedIds = emptySet(),
+                    failedIds = emptySet(),
+                    running = false,
+                    collecting = true,
+                    startedWith = 0,
+                    startedAt = null,
+                    discoveredCount = 0,
+                    queuedNewCount = 0,
+                    queuedUpdateCount = 0,
+                    skippedUnchangedCount = 0,
+                    listingBatches = 0
+                )
+            }
+            setState(state)
+
+            val seenListingIds = mutableSetOf<Long>()
+            val visitedUrls = mutableSetOf<String>()
+            var stepsThisCollection = 0
+            var stalledRounds = 0
+            var reachedLimit = false
+            try {
+                while (stepsThisCollection < settings.pageLimit) {
+                    if (!scanStore.load().collecting) break
+                    val parsed = readVisibleLinksWithRetry(web, seenListingIds)
+                    if (parsed == null) {
+                        setStatus("Nexus-Liste konnte nicht gelesen werden")
+                        break
+                    }
+
+                    parsed.url?.let { visitedUrls += it }
+                    val freshLinks = parsed.links.filter { seenListingIds.add(it.mod_id) }
+                    if (freshLinks.isNotEmpty()) {
+                        val plan = repo.planListingScan(freshLinks)
+                        val alreadyPlanned = (state.queue.map { it.modId } + state.processedIds).toSet()
+                        val added = plan.candidates.filter { it.link.mod_id !in alreadyPlanned }
+                        val queueItems = added.map { candidate ->
+                            QueueItem(
+                                modId = candidate.link.mod_id,
+                                url = candidate.link.url,
+                                name = candidate.link.name,
+                                listedUpdatedAt = candidate.link.updated_at,
+                                listedVersion = candidate.link.version,
+                                reason = candidate.reason.name
+                            )
+                        }
+                        state = state.copy(
+                            queue = state.queue + queueItems,
+                            lastUrl = parsed.url,
+                            discoveredCount = state.discoveredCount + freshLinks.size,
+                            queuedNewCount = state.queuedNewCount +
+                                added.count { it.reason == ListingScanReason.NEW },
+                            queuedUpdateCount = state.queuedUpdateCount +
+                                added.count { it.reason == ListingScanReason.UPDATED },
+                            skippedUnchangedCount = state.skippedUnchangedCount + plan.unchangedCount,
+                            listingBatches = state.listingBatches + 1
+                        )
+                        stepsThisCollection++
+                        setState(state)
+                        stalledRounds = 0
+                        setStatus(
+                            "Schritt $stepsThisCollection/${settings.pageLimit}: " +
+                                "+${added.count { it.reason == ListingScanReason.NEW }} neu, " +
+                                "+${added.count { it.reason == ListingScanReason.UPDATED }} Updates, " +
+                                "${plan.unchangedCount} unverändert"
+                        )
+                    } else {
+                        stalledRounds++
+                    }
+
+                    if (stepsThisCollection >= settings.pageLimit) {
+                        reachedLimit = true
+                        break
+                    }
+                    if (stalledRounds >= 3) break
+
+                    val directNext = parsed.next_url?.takeIf { next ->
+                        next != parsed.url && next !in visitedUrls
+                    }
+                    if (directNext != null) {
+                        visitedUrls += directNext
+                        web.loadUrl(directNext)
+                        delay(settings.delayMs.coerceAtLeast(1500L))
+                        continue
+                    }
+
+                    val advance = requestNextListingBatch(web)
+                    when (advance?.action) {
+                        "navigate" -> {
+                            val target = advance.next_url?.takeIf { it !in visitedUrls }
+                            if (target != null) {
+                                visitedUrls += target
+                                web.loadUrl(target)
+                            } else {
+                                stalledRounds++
+                            }
+                        }
+                        "clicked", "scrolled" -> Unit
+                        else -> stalledRounds++
+                    }
                     delay(settings.delayMs.coerceAtLeast(1500L))
                 }
-                val parsed = readVisibleLinksWithRetry(web)
-                if (parsed == null) {
-                    setStatus("Listing konnte nicht gelesen werden")
-                    break
-                }
-                val existing = (state.queue.map { it.modId } + state.processedIds).toSet()
-                val added = parsed.links
-                    .filter { it.mod_id !in existing }
-                    .map { QueueItem(it.mod_id, it.url, it.name) }
-                state = state.copy(queue = state.queue + added, lastUrl = parsed.url)
+            } finally {
+                state = state.copy(collecting = false)
                 setState(state)
-                page++
-                setStatus("Listing $page/${settings.pageLimit}: +${added.size} Mods")
-                nextUrl = parsed.next_url
+                val suffix = if (reachedLimit) " • eingestelltes Limit erreicht" else ""
+                setStatus(
+                    "Gesammelt: ${state.queue.size} offen • " +
+                        "${state.skippedUnchangedCount} unverändert übersprungen$suffix"
+                )
             }
-            setStatus("Gesammelt: ${state.queue.size} Mods in der Queue")
         }
     }
 
@@ -690,7 +801,7 @@ class MainActivity : ComponentActivity() {
         settings: ScanSettings,
         setStatus: (String) -> Unit
     ) {
-        if (initial.running || initial.queue.isEmpty()) return
+        if (initial.running || initial.collecting || initial.queue.isEmpty()) return
         var state = initial.copy(
             running = true,
             delayMs = settings.delayMs,
@@ -706,9 +817,34 @@ class MainActivity : ComponentActivity() {
                     break
                 }
                 val item = state.queue.first()
+
+                val stillNeeded = repo.planListingScan(
+                    listOf(
+                        VisibleLink(
+                            mod_id = item.modId,
+                            url = item.url,
+                            name = item.name,
+                            updated_at = item.listedUpdatedAt,
+                            version = item.listedVersion
+                        )
+                    )
+                ).candidates.isNotEmpty()
+                if (!stillNeeded) {
+                    state = state.copy(
+                        queue = state.queue.drop(1),
+                        processedIds = state.processedIds + item.modId,
+                        skippedUnchangedCount = state.skippedUnchangedCount + 1
+                    )
+                    setState(state)
+                    setStatus("Übersprungen: #${item.modId} ist bereits aktuell")
+                    delay(150)
+                    continue
+                }
+
                 state = state.copy(queue = state.queue.drop(1), lastUrl = item.url)
                 setState(state)
-                setStatus("Lade #${item.modId}: ${item.name.ifBlank { "Mod" }}")
+                val reasonLabel = if (item.reason == ListingScanReason.UPDATED.name) "Update" else "Neu"
+                setStatus("$reasonLabel • Lade #${item.modId}: ${item.name.ifBlank { "Mod" }}")
                 web.loadUrl(item.url)
                 delay(settings.delayMs.coerceAtLeast(1500L))
 
@@ -844,7 +980,10 @@ class MainActivity : ComponentActivity() {
         return best
     }
 
-    private suspend fun readVisibleLinksWithRetry(web: WebView): VisibleLinksResult? {
+    private suspend fun readVisibleLinksWithRetry(
+        web: WebView,
+        alreadySeen: Set<Long> = emptySet()
+    ): VisibleLinksResult? {
         var best: VisibleLinksResult? = null
         repeat(10) {
             val result = runCatching {
@@ -853,12 +992,18 @@ class MainActivity : ComponentActivity() {
             }.getOrNull()
             if (result != null) {
                 best = result
-                if (result.links.isNotEmpty()) return result
+                if (result.links.any { it.mod_id !in alreadySeen }) return result
             }
             delay(500)
         }
         return best
     }
+
+    private suspend fun requestNextListingBatch(web: WebView): ListingAdvanceResult? =
+        runCatching {
+            val raw = evaluateJavascript(web, NexusPageParser.advanceListing)
+            json.decodeFromString<ListingAdvanceResult>(decodeJsString(raw))
+        }.getOrNull()
 
     private suspend fun evaluateJavascript(web: WebView, script: String): String =
         suspendCancellableCoroutine { continuation ->
@@ -1255,10 +1400,10 @@ class MainActivity : ComponentActivity() {
                     },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
-                    label = { Text("Listing-Seiten: 1–500") }
+                    label = { Text("Listen-Schritte: 1–500") }
                 )
                 Text(
-                    "3000 ms sind ein sicherer Startwert. Große Läufe zuerst mit wenigen Seiten testen.",
+                    "Ein Schritt ist eine Nexus-Seite oder ein „Mehr laden“-Block. Mit 5 Schritten werden je nach Ansicht deutlich mehr als 20 Mods gefunden. 3000 ms sind ein sicherer Startwert.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -1283,6 +1428,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
             SectionCard("Scan-Regeln") {
+                Text("✓ Bereits bekannte Mods nur bei erkanntem Update erneut scannen")
+                Text("✓ Queue und Fortschritt bleiben nach App-Neustart erhalten")
                 Text("✓ Adult-Mods bleiben erhalten")
                 Text("✓ Nexus-Kategorien werden übernommen")
                 Text("✓ Autor, Statistik und Abhängigkeiten werden erfasst")

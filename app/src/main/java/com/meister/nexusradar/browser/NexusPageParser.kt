@@ -325,25 +325,162 @@ object NexusPageParser {
 
     val collectVisibleModLinks: String = """
         (function() {
-          const seen = new Set();
-          const items = [];
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const normalizeDate = (value) => {
+            if (!value) return null;
+            const cleaned = clean(value);
+            const parsed = new Date(cleaned);
+            return isNaN(parsed.getTime()) ? cleaned : parsed.toISOString();
+          };
+          const hrefId = (href) => {
+            const match = String(href || '').match(/\/skyrimspecialedition\/mods\/(\d+)/i);
+            return match ? Number(match[1]) : 0;
+          };
+          const findContainer = (anchor) => {
+            let node = anchor;
+            for (let depth = 0; node && node !== document.body && depth < 9; depth++, node = node.parentElement) {
+              const marker = clean(
+                (typeof node.className === 'string' ? node.className : '') + ' ' +
+                (node.getAttribute?.('data-testid') || '') + ' ' +
+                (node.getAttribute?.('data-cy') || '')
+              ).toLowerCase();
+              if (node.matches?.('article, li') || /mod[-_ ]?(tile|card|item|result|listing|row)/i.test(marker)) {
+                return node;
+              }
+            }
+            return anchor.parentElement || anchor;
+          };
+          const attributeValue = (container, names) => {
+            const selector = names.map(name => '[' + name + ']').join(',');
+            const nodes = [container, ...container.querySelectorAll(selector)];
+            for (const node of nodes) {
+              for (const name of names) {
+                const value = node.getAttribute?.(name);
+                if (value) return value;
+              }
+            }
+            return null;
+          };
+          const updateFromContainer = (container) => {
+            const direct = attributeValue(container, [
+              'data-updated-at', 'data-updated', 'data-date-modified', 'data-last-updated'
+            ]);
+            if (direct) return normalizeDate(direct);
+
+            const times = [...container.querySelectorAll('time')].map(time => ({
+              value: time.getAttribute('datetime') || time.getAttribute('title') || clean(time.textContent),
+              context: clean(time.parentElement?.textContent)
+            })).filter(item => item.value);
+            const labelled = times.find(item => /last updated|updated|update|aktualisiert/i.test(item.context));
+            if (labelled) return normalizeDate(labelled.value);
+            const parsedTimes = times.map(item => ({
+              value: item.value,
+              stamp: new Date(item.value).getTime()
+            })).filter(item => !isNaN(item.stamp));
+            if (parsedTimes.length) {
+              parsedTimes.sort((a, b) => b.stamp - a.stamp);
+              return normalizeDate(parsedTimes[0].value);
+            }
+
+            const rawText = container.innerText || container.textContent || '';
+            const labelledText = rawText.match(
+              /(?:Last\s+updated|Updated|Update|Aktualisiert)\s*(?:\n|:|-)+\s*([^\n]{3,80})/i
+            );
+            if (labelledText) return normalizeDate(labelledText[1]);
+            const embedded = container.innerHTML.match(
+              /["'](?:dateModified|updatedAt|updated_at|lastUpdated)["']\s*[:=]\s*["']([^"']+)["']/i
+            );
+            return embedded ? normalizeDate(embedded[1]) : null;
+          };
+          const versionFromContainer = (container) => {
+            const direct = attributeValue(container, ['data-version', 'data-current-version']);
+            if (direct) return clean(direct) || null;
+            const rawText = container.innerText || container.textContent || '';
+            const labelled = rawText.match(/(?:^|\n)\s*(?:Current\s+)?Version\s*(?:\n|:|-)+\s*([^\n•|]{1,40})/i);
+            if (labelled) return clean(labelled[1]);
+            const compact = rawText.match(/(?:^|[•|])\s*v(?:ersion)?\s*([0-9][A-Za-z0-9._+\-]{0,39})/i);
+            if (compact) return clean(compact[1]);
+            const embedded = container.innerHTML.match(
+              /["'](?:version|currentVersion)["']\s*[:=]\s*["']([^"']+)["']/i
+            );
+            return embedded ? clean(embedded[1]) : null;
+          };
+
+          const byId = new Map();
           for (const anchor of document.querySelectorAll('a[href*="/skyrimspecialedition/mods/"]')) {
-            const match = anchor.href.match(/\/skyrimspecialedition\/mods\/(\d+)/i);
-            if (!match) continue;
-            const id = Number(match[1]);
-            if (!id || seen.has(id)) continue;
-            seen.add(id);
-            items.push({
+            const id = hrefId(anchor.href);
+            if (!id) continue;
+            const container = findContainer(anchor);
+            const heading = container.querySelector('h1, h2, h3, h4, [data-testid*="title"]');
+            const anchorText = clean(anchor.textContent);
+            const candidate = {
               mod_id: id,
               url: anchor.href.split('?')[0].split('#')[0],
-              name: (anchor.textContent || '').replace(/\s+/g, ' ').trim()
-            });
+              name: clean(heading?.textContent) ||
+                (anchorText.length <= 180 ? anchorText : '') ||
+                clean(anchor.getAttribute('aria-label')) || clean(anchor.getAttribute('title')),
+              updated_at: updateFromContainer(container),
+              version: versionFromContainer(container)
+            };
+            const previous = byId.get(id);
+            const score = (candidate.name ? 1 : 0) + (candidate.version ? 2 : 0) +
+              (candidate.updated_at ? 4 : 0);
+            const previousScore = previous ?
+              (previous.name ? 1 : 0) + (previous.version ? 2 : 0) + (previous.updated_at ? 4 : 0) : -1;
+            if (!previous || score > previousScore) byId.set(id, candidate);
           }
-          const next = document.querySelector('a[rel="next"]') ||
+          const items = [...byId.values()];
+          const next = document.querySelector('link[rel="next"], a[rel="next"]') ||
             [...document.querySelectorAll('a')].find(anchor =>
-              /^(next|weiter|›|→)$/i.test((anchor.textContent || '').trim()) && /page=/i.test(anchor.href || '')
+              /^(next|weiter|nächste|›|»|→)$/i.test(clean(anchor.textContent) || clean(anchor.getAttribute('aria-label')))
             );
-          return JSON.stringify({kind:'links', url:location.href, next_url:next ? next.href : null, links:items});
+          const nextUrl = next?.href && !hrefId(next.href) ? next.href : null;
+          return JSON.stringify({kind:'links', url:location.href, next_url:nextUrl, links:items});
+        })();
+    """.trimIndent()
+
+    val advanceListing: String = """
+        (function() {
+          const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const visible = (element) => {
+            if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+          };
+          const pattern = /^(?:(?:load|show|view)\s+(?:\d+\s+)?more(?:\s+mods)?|more\s+mods|mehr\s+(?:\d+\s+)?(?:laden|anzeigen)|next(?:\s+page)?|weiter|nächste(?:\s+seite)?|›|»|→)$/i;
+          const controls = [...document.querySelectorAll('button, a[href], [role="button"]')];
+          const control = controls.find(element => {
+            if (!visible(element) || element.closest('article')) return false;
+            const label = clean(element.textContent) || clean(element.getAttribute('aria-label')) ||
+              clean(element.getAttribute('title'));
+            const marker = clean(
+              (element.getAttribute('data-testid') || '') + ' ' +
+              (element.getAttribute('data-cy') || '') + ' ' +
+              (typeof element.className === 'string' ? element.className : '')
+            );
+            return pattern.test(label) || /(load|show)[-_ ]?more|pagination[-_ ]?next/i.test(marker);
+          });
+          if (control) {
+            const href = control.href || control.closest('a[href]')?.href || null;
+            if (href && href !== location.href && !/\/skyrimspecialedition\/mods\/\d+/i.test(href)) {
+              return JSON.stringify({action:'navigate', next_url:href});
+            }
+            try {
+              control.scrollIntoView({block:'center'});
+              control.click();
+              return JSON.stringify({action:'clicked', next_url:null});
+            } catch (_) {}
+          }
+          const scrolling = document.scrollingElement || document.documentElement;
+          const before = scrolling.scrollTop;
+          scrolling.scrollTop = scrolling.scrollHeight;
+          window.dispatchEvent(new Event('scroll'));
+          document.dispatchEvent(new Event('scroll'));
+          return JSON.stringify({
+            action: scrolling.scrollTop !== before ? 'scrolled' : 'none',
+            next_url: null
+          });
         })();
     """.trimIndent()
 }

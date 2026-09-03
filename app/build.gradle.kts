@@ -14,8 +14,8 @@ android {
         applicationId = "com.meister.nexusradar"
         minSdk = 28
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.10.0"
+        versionCode = 11
+        versionName = "0.11.0"
     }
     buildFeatures { compose = true }
     compileOptions {
@@ -40,4 +40,5 @@ dependencies {
     implementation("androidx.room:room-ktx:2.7.2")
     ksp("androidx.room:room-compiler:2.7.2")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    testImplementation("junit:junit:4.13.2")
 }

@@ -29,6 +29,9 @@ interface ModDao {
     @Query("SELECT * FROM mods WHERE modId = :id LIMIT 1")
     suspend fun byId(id: Long): ModEntity?
 
+    @Query("SELECT * FROM mods WHERE modId IN (:ids)")
+    suspend fun byIds(ids: List<Long>): List<ModEntity>
+
     @Query("SELECT COUNT(*) FROM mods")
     suspend fun count(): Int
 

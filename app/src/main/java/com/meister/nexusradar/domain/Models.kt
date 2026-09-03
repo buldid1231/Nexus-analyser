@@ -51,10 +51,24 @@ data class NexusFileMetrics(
     val main_files_count: Int = 0
 )
 
-@Serializable data class VisibleLink(val mod_id: Long, val url: String, val name: String = "")
+@Serializable
+data class VisibleLink(
+    val mod_id: Long,
+    val url: String,
+    val name: String = "",
+    val updated_at: String? = null,
+    val version: String? = null
+)
+
 @Serializable data class VisibleLinksResult(
     val kind: String = "links",
     val url: String? = null,
     val next_url: String? = null,
     val links: List<VisibleLink> = emptyList()
+)
+
+@Serializable
+data class ListingAdvanceResult(
+    val action: String = "none",
+    val next_url: String? = null
 )

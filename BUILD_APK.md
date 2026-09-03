@@ -15,8 +15,8 @@ Dieses Projekt enthält `.github/workflows/android-apk.yml`.
 4. Workflow **Build Android APK** auswählen.
 5. **Run workflow** drücken und `main` auswählen.
 6. Nach erfolgreichem Lauf den Workflow öffnen.
-7. Unter **Artifacts** `NexusSkyrimRadar-v0.10-debug-apk` herunterladen.
-8. ZIP entpacken und `NexusSkyrimRadar-v0.10-debug.apk` auf Android installieren.
+7. Unter **Artifacts** `NexusSkyrimRadar-v0.11-debug-apk` herunterladen.
+8. ZIP entpacken und `NexusSkyrimRadar-v0.11-debug.apk` auf Android installieren.
 
 ## Automatisch
 

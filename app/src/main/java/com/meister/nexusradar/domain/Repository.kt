@@ -15,6 +15,23 @@ class Repository(private val dao: ModDao) {
 
     fun observeMods(): Flow<List<ModEntity>> = dao.observeAll()
 
+    suspend fun planListingScan(links: List<VisibleLink>): ListingScanPlan {
+        if (links.isEmpty()) return ListingScanPlan(emptyList(), 0, 0, 0)
+        val previousById = links.map { it.mod_id }.distinct().chunked(500)
+            .flatMap { dao.byIds(it) }
+            .associateBy { it.modId }
+        val candidates = links.mapNotNull { link ->
+            ListingUpdateDecider.decide(link, previousById[link.mod_id])
+                ?.let { PlannedListingMod(link, it) }
+        }
+        return ListingScanPlan(
+            candidates = candidates,
+            newCount = candidates.count { it.reason == ListingScanReason.NEW },
+            updateCount = candidates.count { it.reason == ListingScanReason.UPDATED },
+            unchangedCount = links.size - candidates.size
+        )
+    }
+
     suspend fun importSingle(record: NexusModRecord): ImportResult = importRecords(listOf(record))
 
     suspend fun importJson(text: String): ImportResult {
